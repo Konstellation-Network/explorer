@@ -52,7 +52,11 @@ command -v curl >/dev/null 2>&1 || fail "curl not found"
 # rpc URL METHOD PARAMS-JSON  → raw JSON body on stdout; exit 1 on transport error
 rpc() {
   _url="$1"; _method="$2"; _params="$3"
-  curl -sS --max-time "$CURL_MAX_TIME" -X POST -H 'content-type: application/json' \
+  # --retry-connrefused: a node whose accept queue is briefly full (an indexer
+  # opening its connection pool at the same moment) refuses for a moment;
+  # that is not "not an archive node".
+  curl -sS --max-time "$CURL_MAX_TIME" --retry 3 --retry-connrefused --retry-delay 2 \
+    -X POST -H 'content-type: application/json' \
     --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$_method\",\"params\":$_params}" \
     "$_url" 2>/dev/null
 }

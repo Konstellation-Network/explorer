@@ -61,7 +61,7 @@ docker compose --env-file .env.local up -d
 docker compose --env-file .env.local logs -f rpc-preflight backend
 ```
 
-Then open http://localhost:4000 (stats API on :4001). The backend reaches the
+Then open http://localhost:3080 (stats API on :3081). The backend reaches the
 node at `host.docker.internal:8545`, which Docker Desktop maps to the host's
 loopback. On Linux `host.docker.internal` resolves to the bridge gateway, so a
 node bound to `127.0.0.1` is *not* reachable — either set `[json-rpc]
@@ -72,7 +72,7 @@ Stop with `docker compose --env-file .env.local down` (add `-v` to drop the
 indexed database — required after `local_node.sh -y`, which is a new chain
 with the same id; the explorer cannot tell and will serve stale blocks).
 
-Ports 4000/4001 were picked to stay clear of the node's 8545/8546 and of
+Ports 3080/3081 were picked to stay clear of the node's 8545/8546 and of
 anything privileged. Change `EXPLORER_PORT`/`STATS_PORT` (and the matching
 `*_PUBLIC_*` values) in `.env.local` if they collide.
 
@@ -102,7 +102,9 @@ anything privileged. Change `EXPLORER_PORT`/`STATS_PORT` (and the matching
 - **RPC**: `ETHEREUM_JSONRPC_VARIANT=geth` (cosmos/evm exposes the geth
   dialect, §7.1), separate `ETHEREUM_JSONRPC_TRACE_URL` so a dedicated trace
   endpoint can be used later, `ETHEREUM_JSONRPC_WS_URL` for `newHeads`,
-  block-level tracing (`ETHEREUM_JSONRPC_GETH_TRACE_BY_BLOCK=true`).
+  per-transaction tracing (`ETHEREUM_JSONRPC_GETH_TRACE_BY_BLOCK=false` —
+  cosmos/evm's `debug_traceBlockByNumber` lacks the per-entry `txHash`
+  Blockscout's block-level parser needs; see `envs/backend.common.env`).
 - **Indexer**: batch sizes and concurrency lowered for a low-throughput chain
   (`envs/backend.common.env`, each knob commented). Block-reward, withdrawal,
   and pending-tx fetchers are off (no EVM-side rewards — issuance is `x/mint`;
