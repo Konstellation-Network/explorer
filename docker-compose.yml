@@ -1,0 +1,242 @@
+# Konstellation block explorer — Blockscout (ENGINEERING.md §6.5).
+#
+# One compose file serves every network; the network is picked by the env file:
+#
+#   docker compose --env-file .env.local up -d            # dev chain, 56670
+#   docker compose --env-file .env.testnet-1 up -d        # testnet-1, 56671
+#   docker compose --env-file .env.konstellation-1 up -d  # mainnet, 5667
+#
+# Layout mirrors upstream blockscout/blockscout `docker-compose/` (backend,
+# frontend, postgres, redis, stats, smart-contract-verifier, user-ops-indexer,
+# nginx proxy) with the per-service upstream `envs/common-*.env` files kept
+# under envs/. Values that differ per network live only in the .env.<net>
+# file and are interpolated below.
+#
+# Images are pinned to a tag AND a digest (ENGINEERING.md §2.3 — never a
+# branch, never `latest`). Bump them deliberately: change the tag, re-resolve
+# the digest with `docker buildx imagetools inspect <image:tag>`, and record it
+# in the commit message.
+#
+# The backend refuses to start unless `rpc-preflight` passed: the target must
+# be an archive node with the debug namespace (§5.2, §6.5). See
+# scripts/check-rpc.sh.
+
+name: konstellation-explorer
+
+x-host-gateway: &host-gateway
+  # Linux needs this to resolve host.docker.internal; Docker Desktop
+  # (macOS/Windows) provides it anyway.
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+services:
+  # ---------------------------------------------------------------- preflight
+  rpc-preflight:
+    image: curlimages/curl:8.14.1@sha256:9a1ed35addb45476afa911696297f8e115993df459278ed036182dd2cd22b67b
+    <<: *host-gateway
+    restart: "no"
+    environment:
+      RPC_HTTP_URL: ${RPC_HTTP_URL:?set in .env.<net>}
+      RPC_TRACE_URL: ${RPC_TRACE_URL:-${RPC_HTTP_URL}}
+      RPC_WS_URL: ${RPC_WS_URL:?set in .env.<net>}
+      CHAIN_ID: ${CHAIN_ID:?set in .env.<net>}
+    volumes:
+      - ./scripts/check-rpc.sh:/check-rpc.sh:ro
+    entrypoint: ["sh", "/check-rpc.sh"]
+
+  # ---------------------------------------------------------------- datastores
+  redis-db:
+    image: redis:7.4-alpine@sha256:520775a41a63e77e06c73e35d2fd9cc15921a609516818796b4ecbb813078bc7
+    restart: always
+    command: redis-server --save "" --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  db:
+    image: postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
+    restart: always
+    shm_size: 256m
+    command: postgres -c 'max_connections=200' -c 'client_connection_check_interval=60000'
+    environment:
+      POSTGRES_DB: blockscout
+      POSTGRES_USER: blockscout
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env.<net>}
+    volumes:
+      - blockscout-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U blockscout -d blockscout"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  stats-db:
+    image: postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
+    restart: always
+    shm_size: 256m
+    command: postgres -c 'max_connections=200' -c 'client_connection_check_interval=60000'
+    environment:
+      POSTGRES_DB: stats
+      POSTGRES_USER: stats
+      POSTGRES_PASSWORD: ${STATS_POSTGRES_PASSWORD:?set in .env.<net>}
+    volumes:
+      - stats-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stats -d stats"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ---------------------------------------------------------------- backend
+  backend:
+    # Newest tag published to the PUBLIC registry as of 2026-09-20. Blockscout
+    # v10/v11 release images only exist in ghcr.io/blockscout/blockscout-private
+    # (upstream `public-release.yml` is a manual copy that has not run since
+    # 9.0.2); see README "Versions" before bumping.
+    image: ghcr.io/blockscout/blockscout:9.0.2@sha256:7659f168e4e2f6b73dd559ae5278fe96ba67bc2905ea01b57a814c68adf5a9dc
+    <<: *host-gateway
+    restart: always
+    stop_grace_period: 5m
+    depends_on:
+      rpc-preflight:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+      redis-db:
+        condition: service_healthy
+    command: sh -c "bin/blockscout eval \"Elixir.Explorer.ReleaseTasks.create_and_migrate()\" && bin/blockscout start"
+    env_file:
+      - envs/backend.common.env
+    environment:
+      # --- network (from .env.<net>) ---
+      CHAIN_ID: ${CHAIN_ID}
+      NETWORK: Konstellation
+      SUBNETWORK: ${NETWORK_DISPLAY_NAME:?set in .env.<net>}
+      ETHEREUM_JSONRPC_VARIANT: geth
+      ETHEREUM_JSONRPC_HTTP_URL: ${RPC_HTTP_URL}
+      ETHEREUM_JSONRPC_TRACE_URL: ${RPC_TRACE_URL:-${RPC_HTTP_URL}}
+      ETHEREUM_JSONRPC_WS_URL: ${RPC_WS_URL}
+      # --- secrets (from .env.<net>) ---
+      DATABASE_URL: postgresql://blockscout:${POSTGRES_PASSWORD}@db:5432/blockscout
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set in .env.<net>}
+      # --- microservices in this stack ---
+      MICROSERVICE_SC_VERIFIER_ENABLED: "true"
+      MICROSERVICE_SC_VERIFIER_URL: http://smart-contract-verifier:8050/
+      MICROSERVICE_SC_VERIFIER_TYPE: sc_verifier
+      MICROSERVICE_ACCOUNT_ABSTRACTION_ENABLED: "true"
+      MICROSERVICE_ACCOUNT_ABSTRACTION_URL: http://user-ops-indexer:8050/
+      ACCOUNT_REDIS_URL: redis://redis-db:6379
+    volumes:
+      - backend-logs:/app/logs
+      - backend-dets:/app/dets
+
+  # ---------------------------------------------------------------- frontend
+  frontend:
+    # Newest public tag (see backend note); v2.4+ ship only to the private registry.
+    image: ghcr.io/blockscout/frontend:v2.3.5@sha256:4b69f44148414b55c6b8550bc3270c63c9f99e923d54ef0b307e762af6bac90a
+    restart: always
+    depends_on:
+      - backend
+    env_file:
+      - envs/frontend.common.env
+    environment:
+      NEXT_PUBLIC_NETWORK_ID: ${CHAIN_ID}
+      NEXT_PUBLIC_NETWORK_NAME: ${NETWORK_DISPLAY_NAME}
+      NEXT_PUBLIC_NETWORK_SHORT_NAME: Konstellation
+      NEXT_PUBLIC_NETWORK_RPC_URL: ${PUBLIC_RPC_URL:?set in .env.<net>}
+      NEXT_PUBLIC_IS_TESTNET: ${IS_TESTNET:?set in .env.<net>}
+      # Where the browser reaches this stack (the nginx proxy below).
+      NEXT_PUBLIC_API_HOST: ${EXPLORER_HOST:?set in .env.<net>}
+      NEXT_PUBLIC_API_PORT: ${EXPLORER_PUBLIC_PORT:-}
+      NEXT_PUBLIC_API_PROTOCOL: ${EXPLORER_PROTOCOL:?set in .env.<net>}
+      NEXT_PUBLIC_API_WEBSOCKET_PROTOCOL: ${EXPLORER_WS_PROTOCOL:?set in .env.<net>}
+      NEXT_PUBLIC_APP_HOST: ${EXPLORER_HOST}
+      NEXT_PUBLIC_APP_PORT: ${EXPLORER_PUBLIC_PORT:-}
+      NEXT_PUBLIC_APP_PROTOCOL: ${EXPLORER_PROTOCOL}
+      NEXT_PUBLIC_STATS_API_HOST: ${STATS_PUBLIC_URL:?set in .env.<net>}
+      # branding/ is served by the proxy at /branding/ (see nginx/default.conf.template)
+      NEXT_PUBLIC_NETWORK_LOGO: ${EXPLORER_PUBLIC_URL:?set in .env.<net>}/branding/logo.svg
+      NEXT_PUBLIC_NETWORK_ICON: ${EXPLORER_PUBLIC_URL}/branding/icon.svg
+
+  # ---------------------------------------------------------------- stats
+  stats:
+    image: ghcr.io/blockscout/stats:v2.19.1@sha256:a618847070aa0d8256b99082de882f6c5fca7cd20721e04511ee0e1bb5d0b6b5
+    restart: always
+    depends_on:
+      stats-db:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    env_file:
+      - envs/stats.common.env
+    environment:
+      STATS__DB_URL: postgres://stats:${STATS_POSTGRES_PASSWORD}@stats-db:5432/stats
+      STATS__BLOCKSCOUT_DB_URL: postgresql://blockscout:${POSTGRES_PASSWORD}@db:5432/blockscout
+      STATS__BLOCKSCOUT_API_URL: http://backend:4000
+      STATS__CREATE_DATABASE: "true"
+      STATS__RUN_MIGRATIONS: "true"
+
+  # ---------------------------------------------------------------- verifier
+  smart-contract-verifier:
+    image: ghcr.io/blockscout/smart-contract-verifier:v1.10.7@sha256:0b82d1e2f57354b5aa785b33cc82d24a1d2e2d5838dce6adcb81e8bc144c1724
+    restart: always
+    env_file:
+      - envs/smart-contract-verifier.common.env
+    volumes:
+      - verifier-compilers:/tmp/solidity-compilers
+      - verifier-vyper-compilers:/tmp/vyper-compilers
+
+  # ---------------------------------------------------------------- ERC-4337
+  user-ops-indexer:
+    # Indexes UserOperations through the preinstalled EntryPoints (ENGINEERING.md
+    # §6.3: v0.7 + v0.8 at their canonical addresses; no v0.6 on Konstellation).
+    image: ghcr.io/blockscout/user-ops-indexer:v1.4.3@sha256:d0ffe9c672d9c5cf1e035b2dd8e4baf9e9b28d3382822ea2d07e69a924562932
+    <<: *host-gateway
+    restart: always
+    depends_on:
+      rpc-preflight:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    env_file:
+      - envs/user-ops-indexer.common.env
+    environment:
+      USER_OPS_INDEXER__INDEXER__RPC_URL: ${RPC_WS_URL}
+      USER_OPS_INDEXER__DATABASE__CONNECT__URL: postgresql://blockscout:${POSTGRES_PASSWORD}@db:5432/blockscout
+      USER_OPS_INDEXER__DATABASE__RUN_MIGRATIONS: "true"
+
+  # ---------------------------------------------------------------- proxy
+  proxy:
+    image: nginx:1.28-alpine@sha256:a8b39bd9cf0f83869a2162827a0caf6137ddf759d50a171451b335cecc87d236
+    restart: always
+    depends_on:
+      - backend
+      - frontend
+      - stats
+    volumes:
+      - ./nginx:/etc/nginx/templates:ro
+      - ./branding:/usr/share/nginx/branding:ro
+    environment:
+      BACK_PROXY_PASS: http://backend:4000
+      FRONT_PROXY_PASS: http://frontend:3000
+      STATS_PROXY_PASS: http://stats:8050
+      CORS_ORIGIN: ${EXPLORER_PUBLIC_URL}
+    ports:
+      - target: 80
+        published: ${EXPLORER_PORT:-80}
+      - target: 8080
+        published: ${STATS_PORT:-8080}
+
+volumes:
+  blockscout-db-data:
+  stats-db-data:
+  backend-logs:
+  backend-dets:
+  verifier-compilers:
+  verifier-vyper-compilers:

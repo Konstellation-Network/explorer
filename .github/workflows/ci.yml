@@ -1,0 +1,98 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # actions pinned to commit SHAs (ENGINEERING.md §2.3): actions/checkout v5.0.0
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+
+      # Every network's env file must render a valid compose project. `config`
+      # resolves interpolation, so a missing `${VAR:?}` fails here, not at
+      # deploy time. Images are not pulled.
+      - name: docker compose config (all env files)
+        run: |
+          set -eu
+          for env in .env.local .env.testnet-1 .env.konstellation-1; do
+            echo "== $env"
+            docker compose --env-file "$env" config --quiet
+          done
+
+      # No image may float: every `image:` line carries a tag and a digest.
+      - name: images are pinned by tag and digest
+        run: |
+          set -eu
+          bad=0
+          while IFS= read -r line; do
+            img=$(printf '%s' "$line" | sed -E 's/^[[:space:]]*image:[[:space:]]*//')
+            case "$img" in
+              *:latest*|*:latest@*) echo "floating tag: $img"; bad=1 ;;
+            esac
+            case "$img" in
+              *@sha256:*) ;;
+              *) echo "no digest: $img"; bad=1 ;;
+            esac
+          done < <(grep -E '^[[:space:]]*image:' docker-compose.yml)
+          exit $bad
+
+      # The placeholder networks must still be placeholders until infra exists;
+      # a hostname sneaking in without a TODO marker is the thing to catch.
+      - name: placeholder env files carry TODO markers
+        run: |
+          set -eu
+          for env in .env.testnet-1 .env.konstellation-1; do
+            grep -q 'TODO' "$env" || { echo "$env has no TODO markers — was it filled in with real hosts? Those belong in the deployment secret store, not git."; exit 1; }
+            ! grep -E '^(POSTGRES_PASSWORD|STATS_POSTGRES_PASSWORD|SECRET_KEY_BASE)=' "$env" | grep -vq '=TODO$' || { echo "$env contains a real secret"; exit 1; }
+          done
+
+      - name: chain ids match ENGINEERING.md §1
+        run: |
+          set -eu
+          grep -q '^CHAIN_ID=56670$' .env.local
+          grep -q '^CHAIN_ID=56671$' .env.testnet-1
+          grep -q '^CHAIN_ID=5667$'  .env.konstellation-1
+
+      - name: shellcheck
+        run: |
+          sudo apt-get install -y -qq shellcheck >/dev/null
+          shellcheck -s sh scripts/*.sh
+
+      - name: preflight refuses a non-archive / non-debug RPC
+        # A stand-in RPC that answers eth_chainId but errors on historical
+        # state and has no debug namespace must be rejected. Uses only python
+        # from the runner image.
+        run: |
+          set -eu
+          python3 - <<'PY' &
+          import json
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          class H(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  req = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                  m = req['method']
+                  if m == 'eth_chainId': r = {'result': '0xdd5e'}
+                  elif m == 'eth_blockNumber': r = {'result': '0x1000'}
+                  elif m == 'eth_getBalance': r = {'error': {'code': -32000, 'message': 'version 1 does not exist (pruned)'}}
+                  elif m.startswith('debug_'): r = {'error': {'code': -32601, 'message': 'method not found'}}
+                  else: r = {'result': None}
+                  body = json.dumps({'jsonrpc': '2.0', 'id': req.get('id'), **r}).encode()
+                  self.send_response(200); self.send_header('content-type', 'application/json'); self.end_headers(); self.wfile.write(body)
+              def log_message(self, *a): pass
+          HTTPServer(('127.0.0.1', 18545), H).serve_forever()
+          PY
+          sleep 1
+          if RPC_HTTP_URL=http://127.0.0.1:18545 CHAIN_ID=56670 sh scripts/check-rpc.sh; then
+            echo "preflight accepted a pruned node"; exit 1
+          fi
+          if RPC_HTTP_URL=http://127.0.0.1:18545 CHAIN_ID=5667 sh scripts/check-rpc.sh; then
+            echo "preflight accepted the wrong chain id"; exit 1
+          fi
+          echo "preflight refused both, as it should"

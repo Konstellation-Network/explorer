@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48" role="img" aria-label="Konstellation">
+  <!-- PLACEHOLDER icon. Replace with the real mark (see branding/README.md). -->
+  <rect width="48" height="48" rx="10" fill="#0b1020"/>
+  <g fill="none" stroke="#7aa2ff" stroke-width="1.5" stroke-linecap="round">
+    <circle cx="12" cy="26" r="2.5" fill="#7aa2ff"/>
+    <circle cx="24" cy="12" r="2.5" fill="#7aa2ff"/>
+    <circle cx="37" cy="30" r="2.5" fill="#7aa2ff"/>
+    <circle cx="27" cy="38" r="2" fill="#7aa2ff"/>
+    <path d="M12 26 L24 12 L37 30 L27 38 L12 26"/>
+  </g>
+</svg>
