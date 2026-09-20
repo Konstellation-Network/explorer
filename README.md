@@ -7,7 +7,8 @@ configuration only; the binary it explores comes from `konstellation`.
 ```
 explorer/
 ├── docker-compose.yml        # backend, frontend, postgres ×2, redis, stats,
-│                             # smart-contract-verifier, user-ops-indexer, nginx
+│                             # smart-contract-verifier, user-ops-indexer,
+│                             # nft-media-handler, nginx; `local-s3` profile
 ├── .env.local                # dev chain, EIP-155 56670 — real, runnable values
 ├── .env.testnet-1            # 56671 — PLACEHOLDERS (TODO) until infra exists
 ├── .env.konstellation-1      # 5667  — PLACEHOLDERS (TODO) until infra exists
@@ -113,11 +114,51 @@ anything privileged. Change `EXPLORER_PORT`/`STATS_PORT` (and the matching
 - **ERC-4337**: `user-ops-indexer` with EntryPoint **v0.7** and **v0.8** at the
   preinstalled canonical addresses (`contracts/preinstalls/EntryPointV0{7,8}.json`),
   v0.6 off; the backend and frontend have the account-abstraction views on.
-- **Verification**: `smart-contract-verifier` (solc + vyper). Sourcify is off —
-  it does not know the chain.
+- **Verification**: `smart-contract-verifier` (solc + vyper), run as
+  `linux/amd64` on every host (the solc binaries it downloads are amd64; a
+  native arm64 container cannot exec them) with `verifier-init` chowning the
+  compiler volumes to its uid 1001 (fresh volumes are root-owned and every
+  download failed). Sourcify is off — it does not know the chain. Proven with
+  `forge verify-contract --verifier blockscout --verifier-url
+  http://localhost:3080/api --chain-id 56670` on WKASH: `Pass - Verified`,
+  partial match (its bytecode is metadata-stripped).
+- **NFT media**: see below.
 - **Not run** (upstream's compose has them; dropped to keep the footprint small):
   `visualizer` (sol2uml), `sig-provider`, `nft_media_handler`, Blockscout
   accounts/auth0, market data (KASH has no listing; `DISABLE_MARKET=true`).
+
+## NFT media
+
+Blockscout shows NFT images two ways: the frontend loads the token's own
+`image` URL, and — when the media handler is on — the backend serves resized
+copies (60/250/500 px, sizes hardcoded upstream) from object storage, so a
+listing page never hits fifty random hosts. The handler is the
+`nft-media-handler` service: the backend image started as a standalone
+worker that talks to the backend over Erlang distribution (fixed IPs on the
+compose network, `RELEASE_COOKIE` shared) and uploads to an
+**S3-compatible bucket over HTTPS** — scheme and port are hardcoded in 9.0.2,
+so the target is Cloudflare R2, AWS S3 or anything with an S3 API behind TLS,
+with anonymous reads on `NFT_MEDIA_S3_PUBLIC_URL` (bucket or CDN).
+Settings and their rationale: `envs/nft-media.common.env`; per network:
+`NFT_MEDIA_S3_*`, `IPFS_GATEWAY_URL`, `RELEASE_COOKIE` in `.env.<net>`.
+
+Locally the `local-s3` profile (on in `.env.local` via `COMPOSE_PROFILES`)
+stands in for the bucket: MinIO on `https://minio:443` with a self-signed
+cert generated once into a volume, an init job that creates the bucket with
+anonymous read, and `local-s3-proxy` on http://localhost:3082 so the browser
+can load thumbnails without trusting that cert. The worker accepts the
+self-signed cert through `NFT_MEDIA_S3_ERL_OPTIONS` (`-ex_aws hackney_opts
+[insecure,...]`, the one knob the release leaves open). Verified 2026-09-20
+with a scratch ERC-721 (three tokens: two https PNGs, one `ipfs://` PNG):
+metadata indexed, thumbnails generated and served, instance pages render.
+
+Two upstream limitations recorded in `docker-compose.yml`: the backend's
+"in progress" media table is persisted and never expires, so it is dropped on
+every start (the backfiller re-queues anything without thumbnails); and
+`ipfs.io` throttles unauthenticated bursts (429) — `.env.local` uses
+pinata's public gateway, real networks should use a paid/pinning gateway.
+Thumbnails are served as `application/octet-stream` (the uploader sets no
+content type; browsers sniff images fine).
 
 ## Versions
 
@@ -135,6 +176,8 @@ on any `image:` without a digest or with `latest`.
 | redis | `redis:7.4-alpine` | |
 | nginx | `nginx:1.28-alpine` | |
 | preflight | `curlimages/curl:8.14.1` | |
+| verifier-init | `alpine:3.22.2` | chowns the compiler volumes |
+| local-s3 (profile) | `quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z`, `quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z`, `alpine/openssl:3.5.4` | dev only |
 
 To bump: change the tag, `docker buildx imagetools inspect <image:tag>` for the
 new digest, run `docker compose --env-file .env.local up -d` against the dev
@@ -150,6 +193,8 @@ chain and watch it index, then commit with both in the message.
   placeholder.
 - `NEXT_PUBLIC_WALLET_CONNECT_PROJECT_ID` is unset, so "add network to
   wallet" / write-contract buttons stay hidden.
+- NFT media bucket (`NFT_MEDIA_S3_*`) and `RELEASE_COOKIE` for testnet-1 /
+  mainnet — need real object storage.
 
 ## Secrets
 

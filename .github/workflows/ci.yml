@@ -50,7 +50,7 @@ jobs:
           set -eu
           for env in .env.testnet-1 .env.konstellation-1; do
             grep -q 'TODO' "$env" || { echo "$env has no TODO markers — was it filled in with real hosts? Those belong in the deployment secret store, not git."; exit 1; }
-            ! grep -E '^(POSTGRES_PASSWORD|STATS_POSTGRES_PASSWORD|SECRET_KEY_BASE)=' "$env" | grep -vq '=TODO$' || { echo "$env contains a real secret"; exit 1; }
+            ! grep -E '^(POSTGRES_PASSWORD|STATS_POSTGRES_PASSWORD|SECRET_KEY_BASE|RELEASE_COOKIE|NFT_MEDIA_S3_ACCESS_KEY_ID|NFT_MEDIA_S3_SECRET_ACCESS_KEY)=' "$env" | grep -vq '=TODO$' || { echo "$env contains a real secret"; exit 1; }
           done
 
       - name: chain ids match ENGINEERING.md §1

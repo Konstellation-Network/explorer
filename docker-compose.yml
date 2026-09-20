@@ -29,6 +29,42 @@ x-host-gateway: &host-gateway
   extra_hosts:
     - "host.docker.internal:host-gateway"
 
+# NFT media: the backend (Erlang node "producer") queues token-instance media
+# URLs; the nft-media-handler container (Erlang node "worker", same image)
+# fetches, resizes (60/250/500 px, hardcoded upstream) and uploads them to an
+# S3-compatible bucket over HTTPS, then hands the result back over Erlang
+# distribution — which needs stable node names, hence the fixed IPs below.
+# The bucket is real object storage on testnet-1/mainnet (NFT_MEDIA_S3_* in
+# .env.<net>); locally the `local-s3` profile runs MinIO behind a self-signed
+# cert (see README "NFT media").
+x-nft-media-env: &nft-media-env
+  NFT_MEDIA_HANDLER_ENABLED: ${NFT_MEDIA_ENABLED:-true}
+  NFT_MEDIA_HANDLER_REMOTE_DISPATCHER_NODE_MODE_ENABLED: "true"
+  NFT_MEDIA_HANDLER_AWS_ACCESS_KEY_ID: ${NFT_MEDIA_S3_ACCESS_KEY_ID:?set in .env.<net>}
+  NFT_MEDIA_HANDLER_AWS_SECRET_ACCESS_KEY: ${NFT_MEDIA_S3_SECRET_ACCESS_KEY:?set in .env.<net>}
+  NFT_MEDIA_HANDLER_AWS_BUCKET_HOST: ${NFT_MEDIA_S3_HOST:?set in .env.<net>}
+  NFT_MEDIA_HANDLER_AWS_BUCKET_NAME: ${NFT_MEDIA_S3_BUCKET:?set in .env.<net>}
+  NFT_MEDIA_HANDLER_AWS_PUBLIC_BUCKET_URL: ${NFT_MEDIA_S3_PUBLIC_URL:?set in .env.<net>}
+  IPFS_GATEWAY_URL: ${IPFS_GATEWAY_URL:-https://ipfs.io/ipfs}
+  IPFS_PUBLIC_GATEWAY_URL: ${IPFS_PUBLIC_GATEWAY_URL:-https://ipfs.io/ipfs}
+  RELEASE_DISTRIBUTION: name
+  RELEASE_COOKIE: ${RELEASE_COOKIE:?set in .env.<net>}
+  ELIXIR_ERL_OPTIONS: ${NFT_MEDIA_S3_ERL_OPTIONS:-}
+
+# ELIXIR_ERL_OPTIONS is empty on real networks. Locally it carries
+# `-ex_aws hackney_opts [insecure,...]` (NFT_MEDIA_S3_ERL_OPTIONS in
+# .env.local) so the worker's S3 client accepts MinIO's self-signed cert:
+# the release hardcodes https:// for the bucket, and hackney verifies against
+# certifi's compiled-in CA list, so no CA can be added at runtime — the only
+# knob is ExAws's hackney options, which nothing in runtime.exs sets, so a
+# VM-level `-App Key Val` flag survives the release's runtime config.
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: ${EXPLORER_SUBNET:-10.56.67.0/24}
+
 services:
   # ---------------------------------------------------------------- preflight
   rpc-preflight:
@@ -108,10 +144,24 @@ services:
         condition: service_healthy
       redis-db:
         condition: service_healthy
-    command: sh -c "bin/blockscout eval \"Elixir.Explorer.ReleaseTasks.create_and_migrate()\" && bin/blockscout start"
+    networks:
+      default:
+        ipv4_address: ${BACKEND_IP:-10.56.67.10}
+    # `rm -f dets/tasks_in_progress`: Blockscout 9.0.2 persists the NFT
+    # media "in progress" table to disk and never expires its entries (the
+    # timestamps are VM-monotonic), so any media URL that was mid-fetch when
+    # the backend stopped is stuck forever after a restart — reproduced
+    # 2026-09-20 (Indexer.NFTMediaHandler.Queue). Dropping the table at start
+    # is safe: the backfiller re-queues every instance without thumbnails.
+    # dets/queue_storage (the pending queue) is kept.
+    command: sh -c "rm -f dets/tasks_in_progress; bin/blockscout eval \"Elixir.Explorer.ReleaseTasks.create_and_migrate()\" && exec bin/blockscout start"
     env_file:
       - envs/backend.common.env
+      - envs/nft-media.common.env
     environment:
+      <<: *nft-media-env
+      NFT_MEDIA_HANDLER_IS_WORKER: "false"
+      RELEASE_NODE: producer@${BACKEND_IP:-10.56.67.10}
       # --- network (from .env.<net>) ---
       CHAIN_ID: ${CHAIN_ID}
       NETWORK: Konstellation
@@ -133,6 +183,28 @@ services:
     volumes:
       - backend-logs:/app/logs
       - backend-dets:/app/dets
+
+  # ---------------------------------------------------------------- NFT media
+  nft-media-handler:
+    # Same image as the backend, started as a standalone media worker.
+    image: ghcr.io/blockscout/blockscout:9.0.2@sha256:7659f168e4e2f6b73dd559ae5278fe96ba67bc2905ea01b57a814c68adf5a9dc
+    restart: always
+    stop_grace_period: 1m
+    depends_on:
+      backend:
+        condition: service_started
+    networks:
+      default:
+        ipv4_address: ${NFT_MEDIA_HANDLER_IP:-10.56.67.11}
+    command: bin/blockscout start
+    env_file:
+      - envs/nft-media.common.env
+    environment:
+      <<: *nft-media-env
+      NFT_MEDIA_HANDLER_IS_WORKER: "true"
+      # producer node -> folder inside the bucket where this network's media goes
+      NFT_MEDIA_HANDLER_NODES_MAP: '{"producer@${BACKEND_IP:-10.56.67.10}": "/${NFT_MEDIA_S3_FOLDER:?set in .env.<net>}"}'
+      RELEASE_NODE: worker@${NFT_MEDIA_HANDLER_IP:-10.56.67.11}
 
   # ---------------------------------------------------------------- frontend
   frontend:
@@ -181,11 +253,38 @@ services:
       STATS__RUN_MIGRATIONS: "true"
 
   # ---------------------------------------------------------------- verifier
+  verifier-init:
+    # The verifier image runs as uid 1001 (`app`) but a fresh named volume is
+    # created root:root 0755, so every compiler download failed with
+    # PermissionDenied (seen 2026-09-20 verifying WKASH). Same fix upstream
+    # applies to postgres (db-init): chown the volumes before the service
+    # starts. Idempotent; runs on every `up`.
+    image: alpine:3.22.2@sha256:4b7ce07002c69e8f3d704a9c5d6fd3053be500b7f1c69fc0d80990c2ad8dd412
+    restart: "no"
+    user: "0:0"
+    command: ["sh", "-c", "chown -R 1001:1001 /compilers/solidity /compilers/vyper && ls -ld /compilers/*"]
+    volumes:
+      - verifier-compilers:/compilers/solidity
+      - verifier-vyper-compilers:/compilers/vyper
+
   smart-contract-verifier:
     image: ghcr.io/blockscout/smart-contract-verifier:v1.10.7@sha256:0b82d1e2f57354b5aa785b33cc82d24a1d2e2d5838dce6adcb81e8bc144c1724
+    # amd64 on every host, as upstream does: the solc binaries it downloads
+    # (SOLC_LIST_URL) are linux-amd64, and an x86 solc inside a native arm64
+    # container dies with "rosetta error: failed to open elf at
+    # /lib64/ld-linux-x86-64.so.2" (seen 2026-09-20 on Apple Silicon). Under
+    # emulation the whole container is x86 and solc runs. Native arm64 hosts
+    # can instead drop this line and set SOLC_LIST_URL to blockscout's
+    # solc.aarch64.list.json (envs/smart-contract-verifier.common.env).
+    platform: linux/amd64
     restart: always
+    depends_on:
+      verifier-init:
+        condition: service_completed_successfully
     env_file:
       - envs/smart-contract-verifier.common.env
+    environment:
+      SMART_CONTRACT_VERIFIER__SOLIDITY__FETCHER__LIST__LIST_URL: ${SOLC_LIST_URL:-https://binaries.soliditylang.org/linux-amd64/list.json}
     volumes:
       - verifier-compilers:/tmp/solidity-compilers
       - verifier-vyper-compilers:/tmp/vyper-compilers
@@ -233,7 +332,83 @@ services:
       - target: 8080
         published: ${STATS_PORT:-8080}
 
+  # ---------------------------------------------------------------- local S3
+  # `COMPOSE_PROFILES=local-s3` (set in .env.local): an S3 stand-in so NFT
+  # media can be tested on the dev chain. Not for any real network.
+  local-s3-certs:
+    profiles: ["local-s3"]
+    image: alpine/openssl:3.5.4@sha256:42c7389ef077aed0eb4e96d0abbd094083d701bbaff1313073b061c0c9cd8278
+    restart: "no"
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e; cd /certs
+        if [ ! -f public.crt ]; then
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
+            -keyout ca.key -out ca.crt -subj "/CN=konstellation-explorer local S3 CA"
+          openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+            -keyout private.key -out minio.csr -subj "/CN=minio"
+          printf 'subjectAltName=DNS:minio,DNS:localhost\n' > san.cnf
+          openssl x509 -req -in minio.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 3650 \
+            -out public.crt -extfile san.cnf
+          chmod 0644 ca.crt public.crt; chmod 0644 private.key
+        fi
+        ls -l /certs
+    volumes:
+      - local-s3-certs:/certs
+
+  minio:
+    profiles: ["local-s3"]
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    restart: always
+    depends_on:
+      local-s3-certs:
+        condition: service_completed_successfully
+    # https on 443: the backend's S3 client is hardcoded to https and port 443
+    command: server /data --address ":443" --certs-dir /certs --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${NFT_MEDIA_S3_ACCESS_KEY_ID}
+      MINIO_ROOT_PASSWORD: ${NFT_MEDIA_S3_SECRET_ACCESS_KEY}
+    volumes:
+      - local-s3-data:/data
+      - local-s3-certs:/certs:ro
+
+  local-s3-init:
+    profiles: ["local-s3"]
+    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+    restart: "no"
+    depends_on:
+      - minio
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        until mc --insecure alias set local https://minio:443 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" >/dev/null 2>&1; do sleep 2; done
+        mc --insecure mb --ignore-existing "local/$$BUCKET"
+        mc --insecure anonymous set download "local/$$BUCKET"
+        echo "bucket $$BUCKET ready, anonymous read"
+    environment:
+      MINIO_ROOT_USER: ${NFT_MEDIA_S3_ACCESS_KEY_ID}
+      MINIO_ROOT_PASSWORD: ${NFT_MEDIA_S3_SECRET_ACCESS_KEY}
+      BUCKET: ${NFT_MEDIA_S3_BUCKET}
+
+  local-s3-proxy:
+    # Plain-http front for the browser (it would refuse MinIO's self-signed
+    # cert); NFT_MEDIA_S3_PUBLIC_URL in .env.local points here.
+    profiles: ["local-s3"]
+    image: nginx:1.28-alpine@sha256:a8b39bd9cf0f83869a2162827a0caf6137ddf759d50a171451b335cecc87d236
+    restart: always
+    depends_on:
+      - minio
+    volumes:
+      - ./nginx/local-s3:/etc/nginx/templates:ro
+    ports:
+      - target: 8082
+        published: ${LOCAL_S3_PUBLIC_PORT:-3082}
+
 volumes:
+  local-s3-certs:
+  local-s3-data:
   blockscout-db-data:
   stats-db-data:
   backend-logs:
