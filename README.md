@@ -138,6 +138,7 @@ Change `EXPLORER_PORT`/`STATS_PORT` and the matching `NEXT_PUBLIC_*_PORT` /
   rewards — issuance is `x/mint`; no beacon withdrawals; the Krakatoa
   mempool's `txpool_*` is unverified against Blockscout — re-enable pending
   txs once it is).
+- **Gas tracker / units**: see "Gas tracker and units" below.
 - **API rate limit**: per client IP behind the proxy
   (`API_RATE_LIMIT_IS_BLOCKSCOUT_BEHIND_PROXY=true`, buckets in redis), 500
   requests per 15 min. Without the flag every visitor shared one bucket keyed
@@ -157,6 +158,39 @@ Change `EXPLORER_PORT`/`STATS_PORT` and the matching `NEXT_PUBLIC_*_PORT` /
 - **Not run** (upstream's compose has them; dropped to keep the footprint small):
   `visualizer` (sol2uml), `sig-provider`, Blockscout accounts/auth0, market
   data (KASH has no listing; `DISABLE_MARKET=true`).
+
+## Gas tracker and units
+
+The home-page "gas tracker" is Blockscout's gas price oracle: the 35/60/90th
+percentiles of what transactions in the last `GAS_PRICE_ORACLE_NUM_OF_BLOCKS`
+blocks paid (EIP-1559: priority fee capped by `max_fee − base_fee`, plus the
+base fee; zero-priced txs are excluded), and when no priced transaction is
+in the window, the next block's base fee. Konstellation has **no base-fee
+floor** (`TOKENOMICS.md §3`, `min_gas_price = 0`), so an idle chain's base fee
+decays to 0 and that fallback is `0.0` — which the frontend renders as
+**"N/A"**. 9.0.2 has no configurable floor (`GAS_PRICE` only feeds the
+`static_gas_price` API field, which the frontend ignores), so
+`envs/backend.common.env` widens the window to 28 800 blocks (~8 h at 1 s
+blocks, ~12 h at 1.5 s): the tracker keeps showing what the last users
+actually paid instead of going blank between transactions.
+
+What it shows: **locally**, "N/A" until someone sends a tx with a tip
+(`cast send … --priority-gas-price 1gwei`), then that tip (base fee 0) for
+the window. **On testnet-1**, the same mechanics; the public RPC's
+node-local `minimum-gas-prices = 1 gwei` (`TOKENOMICS.md §3`, `infra`)
+means every tx that came through it paid ≥ 1 Gesp, so the tracker reads
+~1 Gesp whenever anything happened in the last ~12 h, and "N/A" after a
+longer silence. Priority fees are shown as `priority_fee`, the base fee as
+`base_fee` in `/api/v2/stats` (send `updated-gas-oracle: true` for the full
+objects).
+
+Units: the base unit is **esp**, not wei (1 KASH = 10^18 esp). The frontend
+takes the base-unit name from `NEXT_PUBLIC_NETWORK_CURRENCY_WEI_NAME=esp` and
+labels the 10^9 unit `G` + that name, so gas prices, tx `Gas price` fields
+and the tracker read **Gesp**: 1 Gesp = 10^9 esp = 10^-9 KASH — what
+Ethereum tooling (`cast`, MetaMask) calls 1 gwei. Fees stay in KASH. The
+same ladder is in `branding/token-metadata.json` (`units`). Fiat units are
+off (`NEXT_PUBLIC_GAS_TRACKER_UNITS=['gwei']`): KASH has no market price.
 
 ## NFT media
 
