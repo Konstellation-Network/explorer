@@ -192,6 +192,18 @@ Ethereum tooling (`cast`, MetaMask) calls 1 gwei. Fees stay in KASH. The
 same ladder is in `branding/token-metadata.json` (`units`). Fiat units are
 off (`NEXT_PUBLIC_GAS_TRACKER_UNITS=['gwei']`): KASH has no market price.
 
+The history charts (gas-tracker page, `/stats`) come from the `stats`
+microservice, whose shipped `charts.json` says "ETH" and "Gwei"; the frontend
+prints whatever `units` the stats API returns. `envs/stats.common.env`
+overrides just those through the service's per-chart env syntax
+(`STATS_CHARTS__TEMPLATE_VALUES__NATIVE_COIN_SYMBOL=KASH` for every fee,
+holder and transfer chart; `…LINE_CHARTS__AVERAGE_GAS_PRICE__UNITS=Gesp` and
+its description). Checked after the change: the stats API
+(`/api/v1/lines`, `/counters`), the backend API and the server-rendered
+pages carry no "Gwei"/"wei"/"ETH" label; the only such strings left in the
+frontend bundle are internal identifiers (`showGweiTooltip`, the `'gwei'`
+unit key), wallet chain lists and mock data — not user-visible.
+
 ## NFT media
 
 Blockscout shows NFT images two ways: the frontend loads the token's own
