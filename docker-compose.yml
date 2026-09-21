@@ -77,13 +77,52 @@ x-nft-media-common: &nft-media-common
 # hackney verifies against certifi's compiled-in CA list, so that hackney
 # option — which nothing in runtime.exs sets — is the only knob).
 
+# Networks — least reach between containers:
+#   default   egress + the internet-facing proxy/frontend; also where the
+#             backend, stats and user-ops-indexer talk to each other
+#   data      internal: postgres ×2 and redis, reachable only by backend,
+#             stats and user-ops-indexer — not by the proxy, frontend, the
+#             media worker (SSRF surface) or the verifier (compiles
+#             untrusted input)
+#   verifier  the backend and the verifier alone; not internal because the
+#             verifier downloads compiler binaries. Nothing else can reach
+#             its unauthenticated API.
+#   erlang    internal: backend + media worker distribution (see above)
 networks:
   default: {}
+  data:
+    internal: true
+  verifier: {}
   erlang:
     internal: true
     ipam:
       config:
         - subnet: ${ERLANG_SUBNET:-10.56.67.0/24}
+
+# Per-service ceilings so one runaway (a compile bomb in the verifier, a
+# media fetch, a BEAM leak) cannot take the host down with it. Compose
+# applies deploy.resources.limits without swarm.
+x-limits-large: &limits-large
+  deploy:
+    resources:
+      limits:
+        cpus: "2"
+        memory: 4g
+        pids: 2048
+x-limits-medium: &limits-medium
+  deploy:
+    resources:
+      limits:
+        cpus: "1"
+        memory: 1g
+        pids: 512
+x-limits-small: &limits-small
+  deploy:
+    resources:
+      limits:
+        cpus: "1"
+        memory: 512m
+        pids: 256
 
 services:
   # ---------------------------------------------------------------- preflight
@@ -103,11 +142,17 @@ services:
   # ---------------------------------------------------------------- datastores
   redis-db:
     image: redis:7.4-alpine@sha256:520775a41a63e77e06c73e35d2fd9cc15921a609516818796b4ecbb813078bc7
-    <<: *logging
+    <<: [*logging, *limits-small]
     restart: always
-    command: redis-server --save "" --appendonly no
+    networks: [data]
+    # password-protected even on the internal network: it holds the
+    # rate-limit buckets and account cache, and anything that reaches it
+    # can flush or rewrite them
+    command: redis-server --save "" --appendonly no --requirepass "${REDIS_PASSWORD:?set in .env.<net>}"
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -116,6 +161,7 @@ services:
     image: postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
     <<: *logging
     restart: always
+    networks: [data]
     shm_size: 256m
     command: postgres -c 'max_connections=200' -c 'client_connection_check_interval=60000'
     environment:
@@ -136,6 +182,7 @@ services:
     image: postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
     <<: *logging
     restart: always
+    networks: [data]
     shm_size: 256m
     command: postgres -c 'max_connections=200' -c 'client_connection_check_interval=60000'
     environment:
@@ -158,7 +205,7 @@ services:
     # (upstream `public-release.yml` is a manual copy that has not run since
     # 9.0.2); see README "Versions" before bumping.
     image: ghcr.io/blockscout/blockscout:9.0.2@sha256:7659f168e4e2f6b73dd559ae5278fe96ba67bc2905ea01b57a814c68adf5a9dc
-    <<: [*host-gateway, *logging]
+    <<: [*host-gateway, *logging, *limits-large]
     restart: always
     stop_grace_period: 5m
     depends_on:
@@ -170,6 +217,8 @@ services:
         condition: service_healthy
     networks:
       default: {}
+      data: {}
+      verifier: {}
       erlang:
         ipv4_address: ${BACKEND_IP:-10.56.67.10}
     # `rm -f dets/tasks_in_progress`: Blockscout 9.0.2 persists the NFT
@@ -216,10 +265,10 @@ services:
       MICROSERVICE_SC_VERIFIER_TYPE: sc_verifier
       MICROSERVICE_ACCOUNT_ABSTRACTION_ENABLED: "true"
       MICROSERVICE_ACCOUNT_ABSTRACTION_URL: http://user-ops-indexer:8050/
-      ACCOUNT_REDIS_URL: redis://redis-db:6379
+      ACCOUNT_REDIS_URL: redis://:${REDIS_PASSWORD}@redis-db:6379
       # rate-limit buckets shared through redis (and per client IP — the
       # proxy's XFF is honoured; envs/backend.common.env)
-      API_RATE_LIMIT_HAMMER_REDIS_URL: redis://redis-db:6379
+      API_RATE_LIMIT_HAMMER_REDIS_URL: redis://:${REDIS_PASSWORD}@redis-db:6379
     volumes:
       - backend-logs:/app/logs
       - backend-dets:/app/dets
@@ -228,13 +277,14 @@ services:
   nft-media-handler:
     # Same image as the backend, started as a standalone media worker.
     # Its outbound fetches (arbitrary token-metadata hosts) originate inside
-    # our network; the erlang network is internal, so from there it reaches
-    # only the backend, and the default network gives it the other services
-    # (db, redis, minio) like any container — an SSRF class inherited from
-    # upstream. See README "NFT media" for the egress policy.
+    # our network — an SSRF class inherited from upstream. The backend's
+    # metadata host filter (INDEXER_TOKEN_INSTANCE_HOST_FILTERING_ENABLED,
+    # envs/backend.common.env) is the primary control; this container is
+    # also kept off the data and verifier networks, and the erlang network
+    # is internal. See README "NFT media" for the egress policy.
     profiles: ["nft-media"]
     image: ghcr.io/blockscout/blockscout:9.0.2@sha256:7659f168e4e2f6b73dd559ae5278fe96ba67bc2905ea01b57a814c68adf5a9dc
-    <<: *logging
+    <<: [*logging, *limits-medium]
     restart: always
     stop_grace_period: 1m
     depends_on:
@@ -268,7 +318,7 @@ services:
   frontend:
     # Newest public tag (see backend note); v2.4+ ship only to the private registry.
     image: ghcr.io/blockscout/frontend:v2.3.5@sha256:4b69f44148414b55c6b8550bc3270c63c9f99e923d54ef0b307e762af6bac90a
-    <<: *logging
+    <<: [*logging, *limits-medium]
     restart: always
     depends_on:
       - backend
@@ -302,8 +352,9 @@ services:
   # ---------------------------------------------------------------- stats
   stats:
     image: ghcr.io/blockscout/stats:v2.19.1@sha256:a618847070aa0d8256b99082de882f6c5fca7cd20721e04511ee0e1bb5d0b6b5
-    <<: *logging
+    <<: [*logging, *limits-medium]
     restart: always
+    networks: [default, data]
     depends_on:
       stats-db:
         condition: service_healthy
@@ -336,7 +387,9 @@ services:
 
   smart-contract-verifier:
     image: ghcr.io/blockscout/smart-contract-verifier:v1.10.7@sha256:0b82d1e2f57354b5aa785b33cc82d24a1d2e2d5838dce6adcb81e8bc144c1724
-    <<: *logging
+    <<: [*logging, *limits-large]
+    # only the backend talks to it; it compiles user-supplied sources
+    networks: [verifier]
     # amd64 on every host, as upstream does: the solc binaries it downloads
     # (SOLC_LIST_URL) are linux-amd64, and an x86 solc inside a native arm64
     # container dies with "rosetta error: failed to open elf at
@@ -362,8 +415,9 @@ services:
     # Indexes UserOperations through the preinstalled EntryPoints (ENGINEERING.md
     # §6.3: v0.7 + v0.8 at their canonical addresses; no v0.6 on Konstellation).
     image: ghcr.io/blockscout/user-ops-indexer:v1.4.3@sha256:d0ffe9c672d9c5cf1e035b2dd8e4baf9e9b28d3382822ea2d07e69a924562932
-    <<: [*host-gateway, *logging]
+    <<: [*host-gateway, *logging, *limits-small]
     restart: always
+    networks: [default, data]
     depends_on:
       rpc-preflight:
         condition: service_completed_successfully
@@ -395,6 +449,10 @@ services:
       FRONT_PROXY_PASS: http://frontend:3000
       STATS_PROXY_PASS: http://stats:8050
       CORS_ORIGIN: ${EXPLORER_PUBLIC_URL}
+      # CIDR the TLS ingress connects from; its X-Forwarded-For is trusted,
+      # everyone else's is replaced (nginx/default.conf.template). Empty =
+      # no ingress = nobody is trusted ("0.0.0.0/32" matches nothing).
+      TRUSTED_INGRESS_CIDR: ${TRUSTED_INGRESS_CIDR:-0.0.0.0/32}
     # Published on loopback only: the TLS ingress on the same host is what
     # the internet talks to, and Docker's published ports bypass ufw/nftables
     # INPUT rules. EXPLORER_BIND=0.0.0.0 only if the ingress is elsewhere.

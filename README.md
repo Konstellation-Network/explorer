@@ -38,9 +38,12 @@ therefore needs an **archive node with tracing enabled**, never a pruned RPC
 `scripts/check-rpc.sh` enforces this. It runs as the `rpc-preflight` service
 before the backend starts and refuses (exit 1) unless the target answers
 `eth_chainId` with the expected id, serves `eth_getBalance` at block 1 and at
-head−1000 and `eth_getBlockByNumber` at block 1, exposes
-`debug_traceBlockByNumber` and `debug_traceTransaction`, and accepts a
-WebSocket upgrade. It is a tripwire, not a proof: a node whose pruning window
+head−1000 and `eth_getBlockByNumber` at block 1, traces for real
+(`debug_traceBlockByNumber` on the head, `debug_traceCall` of a plain
+transfer must come back as a `CALL` frame, and `debug_traceTransaction` on a
+recent tx when one exists), and accepts a WebSocket upgrade the way
+Blockscout connects (no `Origin`; set `WS_ORIGIN` to also check a browser
+origin against the node's `ws-origins`). It is a tripwire, not a proof: a node whose pruning window
 has not yet reached those heights (`pruning = "default"` keeps 362 880
 states) passes until it is that tall — `pruning = "nothing"` in the node's
 `app.toml` is the actual guarantee. And `depends_on:
@@ -113,13 +116,24 @@ Change `EXPLORER_PORT`/`STATS_PORT` and the matching `NEXT_PUBLIC_*_PORT` /
    (`EXPLORER_HOST`, `EXPLORER_PROTOCOL`, `EXPLORER_PUBLIC_URL`,
    `STATS_PUBLIC_URL`) and its `NEXT_PUBLIC_*_PORT` variables must stay
    unset behind TLS (an empty value makes the image exit; a set one lands in
-   every absolute URL). The ingress must **set** `X-Forwarded-For` (overwrite,
-   not append): the backend's per-IP rate limit takes the leftmost public
-   address in it, and it must also forward `X-Forwarded-Proto: https`, which
-   the proxy passes through.
-5. The `erlang` network (NFT media) is internal and must stay that way —
-   never attach the stack to a platform-shared network (Erlang distribution
-   with the cookie is remote code execution on the backend).
+   every absolute URL). The ingress must forward `X-Forwarded-Proto: https`
+   (the proxy passes it through) and **set** `X-Forwarded-For` from the real
+   client; the proxy only believes that header when the connection comes
+   from `TRUSTED_INGRESS_CIDR` (the ingress's source range, `127.0.0.1/32`
+   on the same host) and replaces every other client's header with the
+   connecting address — so nobody can pick their rate-limit bucket or
+   exhaust someone else's. Leave it empty only with no ingress at all.
+   `scripts/check-placeholders.sh` warns when the proxy is published beyond
+   loopback with the CIDR empty.
+5. Container reach is least-privilege (`docker-compose.yml` "Networks"):
+   postgres and redis (password-protected, `REDIS_PASSWORD`) sit on an
+   internal `data` network reachable only by backend, stats and
+   user-ops-indexer; the verifier (compiles untrusted sources) shares a
+   `verifier` network with the backend alone; Erlang distribution (NFT
+   media) is on the internal `erlang` network. Never attach the stack to a
+   platform-shared network (the Erlang cookie is remote code execution on
+   the backend). Every service has memory/CPU/pid ceilings
+   (`x-limits-*`); raise them per host rather than removing them.
 
 ## What is configured
 
@@ -142,11 +156,25 @@ Change `EXPLORER_PORT`/`STATS_PORT` and the matching `NEXT_PUBLIC_*_PORT` /
 - **API rate limit**: per client IP behind the proxy
   (`API_RATE_LIMIT_IS_BLOCKSCOUT_BEHIND_PROXY=true`, buckets in redis), 500
   requests per 15 min. Without the flag every visitor shared one bucket keyed
-  on nginx's container IP.
+  on nginx's container IP; without `TRUSTED_INGRESS_CIDR` handling a client
+  could choose its bucket by sending its own `X-Forwarded-For`.
+- **Token metadata SSRF guard**: the indexer resolves every tokenURI host
+  and refuses loopback, RFC 1918, link-local/cloud-metadata, CGNAT,
+  multicast and documentation ranges
+  (`INDEXER_TOKEN_INSTANCE_HOST_FILTERING_ENABLED=true`, pinned; IPv6
+  equivalents added via `INDEXER_TOKEN_INSTANCE_CIDR_BLACKLIST`). Verified:
+  token URIs at `http://redis-db:6379/`, `http://169.254.169.254/` and the
+  backend's erlang-network IP all end as `error: blacklist`. Infra egress
+  rules are the second layer, not the first.
+- **Metadata refetch endpoint**: `POST …/instances/{id}/refetch-metadata`
+  is captcha-gated upstream; with no captcha keys (`RE_CAPTCHA_DISABLED=true`)
+  it is open, throttled per instance (5 s) and per client IP by the rate
+  limit. Documented as accepted; add a captcha key if it is abused.
 - **ERC-4337**: `user-ops-indexer` with EntryPoint **v0.7** and **v0.8** at the
   preinstalled canonical addresses (`contracts/preinstalls/EntryPointV0{7,8}.json`),
   v0.6 off; the backend and frontend have the account-abstraction views on.
-- **Verification**: `smart-contract-verifier` (solc + vyper), run as
+- **Verification**: `smart-contract-verifier` (solc + vyper), reachable only
+  from the backend, run as
   `linux/amd64` on every host (the solc binaries it downloads are amd64; a
   native arm64 container cannot exec them) with `verifier-init` chowning the
   compiler volumes to its uid 1001 (fresh volumes are root-owned and every
@@ -170,16 +198,23 @@ floor** (`TOKENOMICS.md §3`, `min_gas_price = 0`), so an idle chain's base fee
 decays to 0 and that fallback is `0.0` — which the frontend renders as
 **"N/A"**. 9.0.2 has no configurable floor (`GAS_PRICE` only feeds the
 `static_gas_price` API field, which the frontend ignores), so
-`envs/backend.common.env` widens the window to 28 800 blocks (~8 h at 1 s
-blocks, ~12 h at 1.5 s): the tracker keeps showing what the last users
-actually paid instead of going blank between transactions.
+the window is the only lever. It is also the oracle's weakness: **anyone can
+set the displayed price** — one overpriced self-transfer is sampled like any
+other tx, and with few samples the percentiles are just that sample (a
+single 1000 Gesp transfer moved the tracker to 143 Gesp for everyone). The
+window decides how long that lasts: upstream's 200 blocks heals in minutes
+but leaves the tracker blank between txs; the 28 800 first tried here made
+a poison last half a day. `envs/backend.common.env` settles on 2 400 blocks
+(~40 min at 1 s, ~1 h at 1.5 s): a manipulated price is gone within an
+hour, and the tracker reads N/A after about an hour of silence. 9.0.2 has
+no median, cap or outlier-rejection knob.
 
 What it shows: **locally**, "N/A" until someone sends a tx with a tip
 (`cast send … --priority-gas-price 1gwei`), then that tip (base fee 0) for
 the window. **On testnet-1**, the same mechanics; the public RPC's
 node-local `minimum-gas-prices = 1 gwei` (`TOKENOMICS.md §3`, `infra`)
 means every tx that came through it paid ≥ 1 Gesp, so the tracker reads
-~1 Gesp whenever anything happened in the last ~12 h, and "N/A" after a
+~1 Gesp whenever anything happened in the last hour, and "N/A" after a
 longer silence. Priority fees are shown as `priority_fee`, the base fee as
 `base_fee` in `/api/v2/stats` (send `updated-gas-oracle: true` for the full
 objects).
@@ -232,13 +267,17 @@ network `backend:4000` answers and `backend:4369` / `:9100` do not. Never
 attach the stack to a platform-shared network. With media off the backend
 runs with `RELEASE_DISTRIBUTION=none` and nothing listens.
 
-Egress: the worker fetches whatever URL a token's metadata names, from inside
-our network — an SSRF class inherited from upstream (it can reach `db`,
-`redis-db`, `minio`, the cloud metadata endpoint). The internal network keeps
-it off the backend's distribution port; for the rest, run the stack with an
-egress policy that denies the worker RFC 1918 ranges and `169.254.0.0/16`
-(platform network policy or an nftables rule on the host) before NFT media
-goes live on a public network.
+Egress: token metadata and media are fetched from whatever URL a token
+names, from inside our network — an SSRF class inherited from upstream. The
+primary control is the backend's host filter (above: every tokenURI host is
+resolved and private/link-local/reserved ranges are refused before any
+request). On top of it the worker container is kept off the `data` and
+`verifier` networks (it can reach the backend's HTTP port and, locally,
+MinIO — nothing that holds state), and the erlang network is internal.
+Belt-and-braces for a public network: an egress policy that denies the
+worker RFC 1918 and `169.254.0.0/16` (platform network policy or an
+nftables rule on the host). The `local-s3` profile is dev-only and
+`scripts/check-placeholders.sh` refuses it for the real networks.
 
 Locally the `local-s3` profile (on in `.env.local` via `COMPOSE_PROFILES`)
 stands in for the bucket: MinIO on `https://minio:443` with a self-signed

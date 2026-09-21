@@ -7,10 +7,16 @@
 #   2. serves historical state — eth_getBalance at block 1 and at a height
 #      well behind the head (a pruned node keeps only the last
 #      `pruning-keep-recent` heights and errors on older ones);
-#   3. exposes the debug namespace — debug_traceBlockByNumber on the latest
-#      block returns a result, and debug_traceTransaction is a known method;
+#   3. exposes the debug namespace AND tracing really works —
+#      debug_traceBlockByNumber on the head, debug_traceCall of a plain
+#      transfer (a real trace, no transaction needed) and, when a
+#      transaction exists in the last 50 blocks (or TRACE_TX_HASH is given),
+#      debug_traceTransaction on it;
 #   4. (if RPC_WS_URL is set) accepts a WebSocket upgrade on the ws endpoint,
-#      which Blockscout uses for the newHeads subscription.
+#      which Blockscout uses for the newHeads subscription. Blockscout's
+#      client sends no Origin header (cosmos/evm admits Origin-less
+#      server-side clients); set WS_ORIGIN to also test a browser origin
+#      against the node's ws-origins list.
 #
 # POSIX sh + curl + sed/grep only, so the same script runs on a laptop and
 # inside the `rpc-preflight` compose service (curlimages/curl has no jq).
@@ -36,8 +42,9 @@
 #                  works — the check is that the node *answers* for an old
 #                  height, not what the balance is. Defaults to the zero address.
 #   TRACE_TX_HASH  (optional) a tx hash to trace; if unset the script looks for
-#                  one in the last 50 blocks and otherwise only checks that the
-#                  method is registered.
+#                  one in the last 50 blocks. Either way debug_traceCall must
+#                  return a real trace.
+#   WS_ORIGIN      (optional) Origin header for the WebSocket check.
 #   CURL_MAX_TIME  (optional) per-request timeout in seconds, default 15.
 
 set -u
@@ -48,6 +55,7 @@ RPC_WS_URL="${RPC_WS_URL:-}"
 CHAIN_ID="${CHAIN_ID:-}"
 ARCHIVE_PROBE_ADDRESS="${ARCHIVE_PROBE_ADDRESS:-0x0000000000000000000000000000000000000000}"
 TRACE_TX_HASH="${TRACE_TX_HASH:-}"
+WS_ORIGIN="${WS_ORIGIN:-}"
 CURL_MAX_TIME="${CURL_MAX_TIME:-15}"
 
 fail() { printf 'check-rpc: FAIL: %s\n' "$*" >&2; exit 1; }
@@ -152,6 +160,14 @@ fi
 printf '%s' "$body" | grep -q '"result":' || fail "debug_traceBlockByNumber($head_hex) errored: $(error_message "$body")"
 ok "debug_traceBlockByNumber works on $RPC_TRACE_URL"
 
+# An empty block traces to [] even when the tracer is broken, so also trace a
+# call: a plain value transfer from the probe address must come back as a
+# CALL frame. This needs no transaction on chain.
+body=$(rpc "$RPC_TRACE_URL" debug_traceCall "[{\"from\":\"$ARCHIVE_PROBE_ADDRESS\",\"to\":\"$ARCHIVE_PROBE_ADDRESS\",\"value\":\"0x0\"}, \"latest\", {\"tracer\":\"callTracer\"}]") || fail "debug_traceCall request failed"
+[ "$(error_code "$body")" = "-32601" ] && fail "debug_traceCall is not available on $RPC_TRACE_URL — the debug namespace is off"
+printf '%s' "$body" | grep -q '"type":[[:space:]]*"CALL"' || fail "debug_traceCall did not return a CALL trace — tracing is not working: $(error_message "$body")$(printf '%s' "$body" | head -c 200)"
+ok "debug_traceCall returns a real trace"
+
 # find a real tx to trace, unless one was given
 if [ -z "$TRACE_TX_HASH" ]; then
   i=$head_dec
@@ -170,8 +186,10 @@ if [ -n "$TRACE_TX_HASH" ]; then
   has_result "$body" || fail "debug_traceTransaction($TRACE_TX_HASH) errored: $(error_message "$body")"
   ok "debug_traceTransaction traced $TRACE_TX_HASH"
 else
-  # no tx in the last 50 blocks: prove the method exists — a registered method
-  # answers a bogus hash with a lookup error, an unregistered one with -32601
+  # no tx in the last 50 blocks: the tracer itself was proven by
+  # debug_traceCall above; here only that the method is registered — a
+  # registered method answers a bogus hash with a lookup error, an
+  # unregistered one with -32601
   zero="0x0000000000000000000000000000000000000000000000000000000000000000"
   body=$(rpc "$RPC_TRACE_URL" debug_traceTransaction "[\"$zero\", {\"tracer\":\"callTracer\"}]") || fail "debug_traceTransaction request failed"
   code=$(error_code "$body")
@@ -186,8 +204,16 @@ if [ -n "$RPC_WS_URL" ]; then
     -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
     -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
     "$http_url" 2>/dev/null || true)
-  [ "$status" = "101" ] || fail "no WebSocket upgrade at $RPC_WS_URL (HTTP $status). Blockscout needs ws for newHeads; check [json-rpc] ws-address and ws-origins in app.toml."
-  ok "WebSocket upgrade accepted at $RPC_WS_URL"
+  [ "$status" = "101" ] || fail "no WebSocket upgrade at $RPC_WS_URL (HTTP $status). Blockscout needs ws for newHeads; check [json-rpc] ws-address in app.toml."
+  ok "WebSocket upgrade accepted at $RPC_WS_URL (no Origin, as Blockscout connects)"
+  if [ -n "$WS_ORIGIN" ]; then
+    status=$(curl -s -o /dev/null --max-time 5 -w '%{http_code}' \
+      -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H "Origin: $WS_ORIGIN" \
+      -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+      "$http_url" 2>/dev/null || true)
+    [ "$status" = "101" ] || fail "WebSocket upgrade with Origin $WS_ORIGIN refused (HTTP $status) — the node's [json-rpc] ws-origins does not allow it"
+    ok "WebSocket upgrade accepted with Origin $WS_ORIGIN"
+  fi
 else
   note "RPC_WS_URL not set; skipping WebSocket check"
 fi

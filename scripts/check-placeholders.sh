@@ -6,6 +6,12 @@
 # `real=TODO` cannot slip past. Secrets must be exactly `TODO`; hosts must
 # start with `TODO-`.
 #
+# Also, for each file: the dev-only `local-s3` profile must be off (no
+# `minio` service rendered), and it warns loudly when the proxy is
+# published beyond loopback (EXPLORER_BIND) with no TRUSTED_INGRESS_CIDR —
+# in that layout every client's X-Forwarded-For is replaced, which is safe,
+# but usually means the ingress was forgotten.
+#
 # Usage: scripts/check-placeholders.sh .env.testnet-1 [.env.konstellation-1 ...]
 set -eu
 
@@ -28,6 +34,7 @@ frontend                  NEXT_PUBLIC_NETWORK_RPC_URL             url
 frontend                  NEXT_PUBLIC_API_HOST                    host
 frontend                  NEXT_PUBLIC_STATS_API_HOST              url
 backend                   BLOCKSCOUT_HOST                         host
+redis-db                  REDIS_PASSWORD                          secret
 '
 
 status=0
@@ -54,5 +61,24 @@ for envfile in "$@"; do
       exit 1
     fi
   done || status=1
+
+  # dev-only profile must not be on for a real network
+  if printf '%s' "$rendered" | jq -e '.services.minio' >/dev/null 2>&1; then
+    echo "  FAIL the local-s3 profile (MinIO stand-in) is enabled — COMPOSE_PROFILES in $envfile must not include local-s3"
+    status=1
+  else
+    echo "  ok   local-s3 profile off"
+  fi
+
+  # deploy-time sanity on exposure
+  bind=$(printf '%s' "$rendered" | jq -r '.services.proxy.ports[0].host_ip // "0.0.0.0"')
+  cidr=$(printf '%s' "$rendered" | jq -r '.services.proxy.environment.TRUSTED_INGRESS_CIDR // ""')
+  if [ "$bind" != "127.0.0.1" ] && { [ -z "$cidr" ] || [ "$cidr" = "0.0.0.0/32" ]; }; then
+    echo "  WARN proxy is published on $bind (EXPLORER_BIND) but TRUSTED_INGRESS_CIDR is empty: no ingress is trusted, so"
+    echo "       every client's X-Forwarded-For is replaced by its own address — fine without an ingress, wrong behind one."
+    echo "       Set TRUSTED_INGRESS_CIDR to the ingress's source range, or EXPLORER_BIND=127.0.0.1 with the ingress on this host."
+  else
+    echo "  ok   proxy bind $bind, trusted ingress ${cidr}"
+  fi
 done
 exit $status

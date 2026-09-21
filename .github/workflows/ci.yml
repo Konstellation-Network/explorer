@@ -101,7 +101,10 @@ jobs:
                       r = {'error': {'code': -32000, 'message': 'version does not exist (pruned)'}} if MODE == 'pruned' else {'result': '0x0'}
                   elif m == 'eth_getBlockByNumber': r = {'result': {'number': p[0], 'transactions': []}}
                   elif m.startswith('debug_'):
-                      r = {'error': {'code': -32601, 'message': 'method not found'}} if MODE == 'nodebug' else ({'result': []} if 'Block' in m else {'error': {'code': -32000, 'message': 'transaction not found'}})
+                      if MODE == 'nodebug': r = {'error': {'code': -32601, 'message': 'method not found'}}
+                      elif m == 'debug_traceBlockByNumber': r = {'result': []}
+                      elif m == 'debug_traceCall': r = {'result': {'from': p[0]['from'], 'to': p[0]['to'], 'gas': '0x5208', 'gasUsed': '0x5208', 'input': '0x', 'value': '0x0', 'type': 'CALL'}}
+                      else: r = {'error': {'code': -32000, 'message': 'transaction not found'}}
                   elif m == 'txpool_status': r = {'result': {'pending': '0x0', 'queued': '0x0'}}
                   else: r = {'result': None}
                   body = json.dumps({'jsonrpc': '2.0', 'id': req.get('id'), **r}).encode()
