@@ -10,7 +10,7 @@ permissions:
 jobs:
   validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       # actions pinned to commit SHAs (ENGINEERING.md §2.3): actions/checkout v5.0.0
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
@@ -43,56 +43,87 @@ jobs:
           done < <(grep -E '^[[:space:]]*image:' docker-compose.yml)
           exit $bad
 
-      # The placeholder networks must still be placeholders until infra exists;
-      # a hostname sneaking in without a TODO marker is the thing to catch.
-      - name: placeholder env files carry TODO markers
-        run: |
-          set -eu
-          for env in .env.testnet-1 .env.konstellation-1; do
-            grep -q 'TODO' "$env" || { echo "$env has no TODO markers — was it filled in with real hosts? Those belong in the deployment secret store, not git."; exit 1; }
-            ! grep -E '^(POSTGRES_PASSWORD|STATS_POSTGRES_PASSWORD|SECRET_KEY_BASE|RELEASE_COOKIE|NFT_MEDIA_S3_ACCESS_KEY_ID|NFT_MEDIA_S3_SECRET_ACCESS_KEY)=' "$env" | grep -vq '=TODO$' || { echo "$env contains a real secret"; exit 1; }
-          done
+      # The placeholder networks stay placeholders until infra exists. Checked
+      # on the RENDERED config, per variable (scripts/check-placeholders.sh),
+      # so `export KEY=`, whitespace, comments or `real=TODO` cannot pass.
+      - name: placeholder env files carry only placeholders
+        run: scripts/check-placeholders.sh .env.testnet-1 .env.konstellation-1
 
       - name: chain ids match ENGINEERING.md §1
         run: |
           set -eu
-          grep -q '^CHAIN_ID=56670$' .env.local
-          grep -q '^CHAIN_ID=56671$' .env.testnet-1
-          grep -q '^CHAIN_ID=5667$'  .env.konstellation-1
+          check() {
+            got=$(docker compose --env-file "$1" config --format json | jq -r '.services.backend.environment.CHAIN_ID')
+            [ "$got" = "$2" ] || { echo "$1 renders CHAIN_ID=$got, expected $2"; exit 1; }
+            echo "$1 -> $got"
+          }
+          check .env.local 56670
+          check .env.testnet-1 56671
+          check .env.konstellation-1 5667
 
       - name: shellcheck
         run: |
           sudo apt-get install -y -qq shellcheck >/dev/null
           shellcheck -s sh scripts/*.sh
 
-      - name: preflight refuses a non-archive / non-debug RPC
-        # A stand-in RPC that answers eth_chainId but errors on historical
-        # state and has no debug namespace must be rejected. Uses only python
-        # from the runner image.
+      # The frontend image validates its NEXT_PUBLIC_* env at startup and exits
+      # on any error (an empty port once put testnet-1 in a restart loop). Run
+      # its validator against each rendered env.
+      - name: frontend env validates for every env file
         run: |
           set -eu
-          python3 - <<'PY' &
-          import json
+          image=$(grep -E '^[[:space:]]*image: ghcr.io/blockscout/frontend:' docker-compose.yml | head -n1 | sed -E 's/^[[:space:]]*image:[[:space:]]*//')
+          docker pull --quiet "$image"
+          for env in .env.local .env.testnet-1 .env.konstellation-1; do
+            echo "== $env"
+            docker compose --env-file "$env" config --format json \
+              | jq -r '.services.frontend.environment | to_entries[] | select(.value != null) | "\(.key)=\(.value)"' > /tmp/frontend.env
+            docker run --rm --env-file /tmp/frontend.env --entrypoint ./validate_envs.sh "$image"
+          done
+
+      - name: preflight refuses pruned / no-debug / wrong-chain RPCs
+        # A stand-in RPC (python from the runner image) in three modes; the
+        # preflight must refuse each for the right reason and accept the
+        # healthy mode.
+        run: |
+          set -eu
+          cat > /tmp/fake_rpc.py <<'PY'
+          import json, os
           from http.server import BaseHTTPRequestHandler, HTTPServer
+          MODE = os.environ["MODE"]  # healthy | pruned | nodebug
           class H(BaseHTTPRequestHandler):
               def do_POST(self):
                   req = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-                  m = req['method']
+                  m = req['method']; p = req.get('params', [])
                   if m == 'eth_chainId': r = {'result': '0xdd5e'}
                   elif m == 'eth_blockNumber': r = {'result': '0x1000'}
-                  elif m == 'eth_getBalance': r = {'error': {'code': -32000, 'message': 'version 1 does not exist (pruned)'}}
-                  elif m.startswith('debug_'): r = {'error': {'code': -32601, 'message': 'method not found'}}
+                  elif m == 'eth_getBalance':
+                      r = {'error': {'code': -32000, 'message': 'version does not exist (pruned)'}} if MODE == 'pruned' else {'result': '0x0'}
+                  elif m == 'eth_getBlockByNumber': r = {'result': {'number': p[0], 'transactions': []}}
+                  elif m.startswith('debug_'):
+                      r = {'error': {'code': -32601, 'message': 'method not found'}} if MODE == 'nodebug' else ({'result': []} if 'Block' in m else {'error': {'code': -32000, 'message': 'transaction not found'}})
+                  elif m == 'txpool_status': r = {'result': {'pending': '0x0', 'queued': '0x0'}}
                   else: r = {'result': None}
                   body = json.dumps({'jsonrpc': '2.0', 'id': req.get('id'), **r}).encode()
                   self.send_response(200); self.send_header('content-type', 'application/json'); self.end_headers(); self.wfile.write(body)
               def log_message(self, *a): pass
           HTTPServer(('127.0.0.1', 18545), H).serve_forever()
           PY
-          sleep 1
-          if RPC_HTTP_URL=http://127.0.0.1:18545 CHAIN_ID=56670 sh scripts/check-rpc.sh; then
-            echo "preflight accepted a pruned node"; exit 1
-          fi
-          if RPC_HTTP_URL=http://127.0.0.1:18545 CHAIN_ID=5667 sh scripts/check-rpc.sh; then
-            echo "preflight accepted the wrong chain id"; exit 1
-          fi
-          echo "preflight refused both, as it should"
+          run_mode() {
+            MODE="$1" python3 /tmp/fake_rpc.py & pid=$!
+            sleep 1
+            set +e
+            RPC_HTTP_URL=http://127.0.0.1:18545 CHAIN_ID="$2" sh scripts/check-rpc.sh > /tmp/out.txt 2>&1; rc=$?
+            set -e
+            kill $pid; wait $pid 2>/dev/null || true
+            echo "--- mode=$1 chain=$2 rc=$rc"; tail -n 2 /tmp/out.txt
+            return $rc
+          }
+          run_mode healthy 56670 || { echo "preflight refused a healthy archive+debug node"; exit 1; }
+          run_mode pruned  56670 && { echo "preflight accepted a pruned node"; exit 1; }
+          grep -q "PRUNED" /tmp/out.txt || { echo "pruned node refused for the wrong reason"; exit 1; }
+          run_mode nodebug 56670 && { echo "preflight accepted a node without the debug namespace"; exit 1; }
+          grep -q "debug namespace is off" /tmp/out.txt || { echo "no-debug node refused for the wrong reason"; exit 1; }
+          run_mode healthy 5667 && { echo "preflight accepted the wrong chain id"; exit 1; }
+          grep -q "wrong network" /tmp/out.txt || { echo "wrong chain refused for the wrong reason"; exit 1; }
+          echo "all four preflight cases behave"

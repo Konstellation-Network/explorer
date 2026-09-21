@@ -8,9 +8,9 @@
 #
 # Layout mirrors upstream blockscout/blockscout `docker-compose/` (backend,
 # frontend, postgres, redis, stats, smart-contract-verifier, user-ops-indexer,
-# nginx proxy) with the per-service upstream `envs/common-*.env` files kept
-# under envs/. Values that differ per network live only in the .env.<net>
-# file and are interpolated below.
+# nft-media-handler, nginx proxy) with the per-service upstream
+# `envs/common-*.env` files kept under envs/. Values that differ per network
+# live only in the .env.<net> file and are interpolated below.
 #
 # Images are pinned to a tag AND a digest (ENGINEERING.md §2.3 — never a
 # branch, never `latest`). Bump them deliberately: change the tag, re-resolve
@@ -19,7 +19,14 @@
 #
 # The backend refuses to start unless `rpc-preflight` passed: the target must
 # be an archive node with the debug namespace (§5.2, §6.5). See
-# scripts/check-rpc.sh.
+# scripts/check-rpc.sh. Note that `service_completed_successfully` is checked
+# by `docker compose up` only — a container restart (crash, `restart: always`
+# after a reboot) does not re-run the preflight. Re-run `up` after changing
+# the RPC target.
+#
+# Profiles (COMPOSE_PROFILES in .env.<net>):
+#   nft-media  the NFT media worker; needs an HTTPS S3 bucket (NFT_MEDIA_S3_*)
+#   local-s3   a MinIO stand-in for that bucket — dev chain only
 
 name: konstellation-explorer
 
@@ -29,47 +36,60 @@ x-host-gateway: &host-gateway
   extra_hosts:
     - "host.docker.internal:host-gateway"
 
+# Every service: rotate the json-file logs. The media worker alone writes
+# ~10 lines/s of `{:badrpc, :nodedown}` while the backend is down.
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "5"
+
 # NFT media: the backend (Erlang node "producer") queues token-instance media
 # URLs; the nft-media-handler container (Erlang node "worker", same image)
 # fetches, resizes (60/250/500 px, hardcoded upstream) and uploads them to an
 # S3-compatible bucket over HTTPS, then hands the result back over Erlang
-# distribution — which needs stable node names, hence the fixed IPs below.
+# distribution. Distribution (EPMD 4369 + one dist port; the cookie is remote
+# code execution) is confined to the `erlang` network below — internal, fixed
+# IPs so node names are stable, only backend and worker attached — and both
+# nodes bind EPMD and the dist listener to their IP on that network
+# (ERL_EPMD_ADDRESS, inet_dist_use_interface), so nothing on the default
+# network, where the internet-facing proxy and frontend live, can reach them.
+# Never attach this stack to a platform-shared network.
+#
 # The bucket is real object storage on testnet-1/mainnet (NFT_MEDIA_S3_* in
 # .env.<net>); locally the `local-s3` profile runs MinIO behind a self-signed
-# cert (see README "NFT media").
-x-nft-media-env: &nft-media-env
-  NFT_MEDIA_HANDLER_ENABLED: ${NFT_MEDIA_ENABLED:-true}
+# cert (README "NFT media"). With NFT_MEDIA_ENABLED=false the S3 values are
+# not required, the `nft-media` profile stays off and the backend runs
+# without distribution (RELEASE_DISTRIBUTION=none).
+x-nft-media-common: &nft-media-common
+  NFT_MEDIA_HANDLER_ENABLED: ${NFT_MEDIA_ENABLED:-false}
   NFT_MEDIA_HANDLER_REMOTE_DISPATCHER_NODE_MODE_ENABLED: "true"
-  NFT_MEDIA_HANDLER_AWS_ACCESS_KEY_ID: ${NFT_MEDIA_S3_ACCESS_KEY_ID:?set in .env.<net>}
-  NFT_MEDIA_HANDLER_AWS_SECRET_ACCESS_KEY: ${NFT_MEDIA_S3_SECRET_ACCESS_KEY:?set in .env.<net>}
-  NFT_MEDIA_HANDLER_AWS_BUCKET_HOST: ${NFT_MEDIA_S3_HOST:?set in .env.<net>}
-  NFT_MEDIA_HANDLER_AWS_BUCKET_NAME: ${NFT_MEDIA_S3_BUCKET:?set in .env.<net>}
-  NFT_MEDIA_HANDLER_AWS_PUBLIC_BUCKET_URL: ${NFT_MEDIA_S3_PUBLIC_URL:?set in .env.<net>}
   IPFS_GATEWAY_URL: ${IPFS_GATEWAY_URL:-https://ipfs.io/ipfs}
   IPFS_PUBLIC_GATEWAY_URL: ${IPFS_PUBLIC_GATEWAY_URL:-https://ipfs.io/ipfs}
-  RELEASE_DISTRIBUTION: name
-  RELEASE_COOKIE: ${RELEASE_COOKIE:?set in .env.<net>}
-  ELIXIR_ERL_OPTIONS: ${NFT_MEDIA_S3_ERL_OPTIONS:-}
+  RELEASE_COOKIE: ${RELEASE_COOKIE:-}
 
-# ELIXIR_ERL_OPTIONS is empty on real networks. Locally it carries
-# `-ex_aws hackney_opts [insecure,...]` (NFT_MEDIA_S3_ERL_OPTIONS in
-# .env.local) so the worker's S3 client accepts MinIO's self-signed cert:
-# the release hardcodes https:// for the bucket, and hackney verifies against
-# certifi's compiled-in CA list, so no CA can be added at runtime — the only
-# knob is ExAws's hackney options, which nothing in runtime.exs sets, so a
-# VM-level `-App Key Val` flag survives the release's runtime config.
+# ELIXIR_ERL_OPTIONS: the `-kernel` flags pin the distribution listener to the
+# node's erlang-network IP and a single port (9100, no dynamic range).
+# NFT_MEDIA_S3_ERL_OPTIONS is empty on real networks; locally it carries
+# `-ex_aws hackney_opts [insecure,...]` so the worker's S3 client accepts
+# MinIO's self-signed cert (the release hardcodes https:// for the bucket and
+# hackney verifies against certifi's compiled-in CA list, so that hackney
+# option — which nothing in runtime.exs sets — is the only knob).
 
 networks:
-  default:
+  default: {}
+  erlang:
+    internal: true
     ipam:
       config:
-        - subnet: ${EXPLORER_SUBNET:-10.56.67.0/24}
+        - subnet: ${ERLANG_SUBNET:-10.56.67.0/24}
 
 services:
   # ---------------------------------------------------------------- preflight
   rpc-preflight:
     image: curlimages/curl:8.14.1@sha256:9a1ed35addb45476afa911696297f8e115993df459278ed036182dd2cd22b67b
-    <<: *host-gateway
+    <<: [*host-gateway, *logging]
     restart: "no"
     environment:
       RPC_HTTP_URL: ${RPC_HTTP_URL:?set in .env.<net>}
@@ -83,6 +103,7 @@ services:
   # ---------------------------------------------------------------- datastores
   redis-db:
     image: redis:7.4-alpine@sha256:520775a41a63e77e06c73e35d2fd9cc15921a609516818796b4ecbb813078bc7
+    <<: *logging
     restart: always
     command: redis-server --save "" --appendonly no
     healthcheck:
@@ -93,12 +114,14 @@ services:
 
   db:
     image: postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
+    <<: *logging
     restart: always
     shm_size: 256m
     command: postgres -c 'max_connections=200' -c 'client_connection_check_interval=60000'
     environment:
       POSTGRES_DB: blockscout
       POSTGRES_USER: blockscout
+      # goes into URLs unescaped (DATABASE_URL etc.): hex only, see .env.<net>
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env.<net>}
     volumes:
       - blockscout-db-data:/var/lib/postgresql/data
@@ -111,6 +134,7 @@ services:
 
   stats-db:
     image: postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
+    <<: *logging
     restart: always
     shm_size: 256m
     command: postgres -c 'max_connections=200' -c 'client_connection_check_interval=60000'
@@ -134,7 +158,7 @@ services:
     # (upstream `public-release.yml` is a manual copy that has not run since
     # 9.0.2); see README "Versions" before bumping.
     image: ghcr.io/blockscout/blockscout:9.0.2@sha256:7659f168e4e2f6b73dd559ae5278fe96ba67bc2905ea01b57a814c68adf5a9dc
-    <<: *host-gateway
+    <<: [*host-gateway, *logging]
     restart: always
     stop_grace_period: 5m
     depends_on:
@@ -145,7 +169,8 @@ services:
       redis-db:
         condition: service_healthy
     networks:
-      default:
+      default: {}
+      erlang:
         ipv4_address: ${BACKEND_IP:-10.56.67.10}
     # `rm -f dets/tasks_in_progress`: Blockscout 9.0.2 persists the NFT
     # media "in progress" table to disk and never expires its entries (the
@@ -159,9 +184,18 @@ services:
       - envs/backend.common.env
       - envs/nft-media.common.env
     environment:
-      <<: *nft-media-env
+      <<: *nft-media-common
       NFT_MEDIA_HANDLER_IS_WORKER: "false"
+      NFT_MEDIA_HANDLER_AWS_ACCESS_KEY_ID: ${NFT_MEDIA_S3_ACCESS_KEY_ID:-}
+      NFT_MEDIA_HANDLER_AWS_SECRET_ACCESS_KEY: ${NFT_MEDIA_S3_SECRET_ACCESS_KEY:-}
+      NFT_MEDIA_HANDLER_AWS_BUCKET_HOST: ${NFT_MEDIA_S3_HOST:-}
+      NFT_MEDIA_HANDLER_AWS_BUCKET_NAME: ${NFT_MEDIA_S3_BUCKET:-}
+      NFT_MEDIA_HANDLER_AWS_PUBLIC_BUCKET_URL: ${NFT_MEDIA_S3_PUBLIC_URL:-}
+      # Erlang distribution: `none` unless NFT media is on (.env.<net>)
+      RELEASE_DISTRIBUTION: ${RELEASE_DISTRIBUTION:-none}
       RELEASE_NODE: producer@${BACKEND_IP:-10.56.67.10}
+      ERL_EPMD_ADDRESS: ${BACKEND_IP:-10.56.67.10}
+      ELIXIR_ERL_OPTIONS: -kernel inet_dist_use_interface ${BACKEND_IP_TUPLE:-{10,56,67,10}} -kernel inet_dist_listen_min 9100 -kernel inet_dist_listen_max 9100 ${NFT_MEDIA_S3_ERL_OPTIONS:-}
       # --- network (from .env.<net>) ---
       CHAIN_ID: ${CHAIN_ID}
       NETWORK: Konstellation
@@ -170,6 +204,9 @@ services:
       ETHEREUM_JSONRPC_HTTP_URL: ${RPC_HTTP_URL}
       ETHEREUM_JSONRPC_TRACE_URL: ${RPC_TRACE_URL:-${RPC_HTTP_URL}}
       ETHEREUM_JSONRPC_WS_URL: ${RPC_WS_URL}
+      # public origin: used for sitemap.xml and absolute links
+      BLOCKSCOUT_HOST: ${EXPLORER_HOST:?set in .env.<net>}
+      BLOCKSCOUT_PROTOCOL: ${EXPLORER_PROTOCOL:?set in .env.<net>}
       # --- secrets (from .env.<net>) ---
       DATABASE_URL: postgresql://blockscout:${POSTGRES_PASSWORD}@db:5432/blockscout
       SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set in .env.<net>}
@@ -180,6 +217,9 @@ services:
       MICROSERVICE_ACCOUNT_ABSTRACTION_ENABLED: "true"
       MICROSERVICE_ACCOUNT_ABSTRACTION_URL: http://user-ops-indexer:8050/
       ACCOUNT_REDIS_URL: redis://redis-db:6379
+      # rate-limit buckets shared through redis (and per client IP — the
+      # proxy's XFF is honoured; envs/backend.common.env)
+      API_RATE_LIMIT_HAMMER_REDIS_URL: redis://redis-db:6379
     volumes:
       - backend-logs:/app/logs
       - backend-dets:/app/dets
@@ -187,56 +227,82 @@ services:
   # ---------------------------------------------------------------- NFT media
   nft-media-handler:
     # Same image as the backend, started as a standalone media worker.
+    # Its outbound fetches (arbitrary token-metadata hosts) originate inside
+    # our network; the erlang network is internal, so from there it reaches
+    # only the backend, and the default network gives it the other services
+    # (db, redis, minio) like any container — an SSRF class inherited from
+    # upstream. See README "NFT media" for the egress policy.
+    profiles: ["nft-media"]
     image: ghcr.io/blockscout/blockscout:9.0.2@sha256:7659f168e4e2f6b73dd559ae5278fe96ba67bc2905ea01b57a814c68adf5a9dc
+    <<: *logging
     restart: always
     stop_grace_period: 1m
     depends_on:
       backend:
         condition: service_started
     networks:
-      default:
+      default: {}
+      erlang:
         ipv4_address: ${NFT_MEDIA_HANDLER_IP:-10.56.67.11}
     command: bin/blockscout start
     env_file:
       - envs/nft-media.common.env
     environment:
-      <<: *nft-media-env
+      <<: *nft-media-common
+      NFT_MEDIA_HANDLER_ENABLED: "true"
       NFT_MEDIA_HANDLER_IS_WORKER: "true"
+      NFT_MEDIA_HANDLER_AWS_ACCESS_KEY_ID: ${NFT_MEDIA_S3_ACCESS_KEY_ID:?set in .env.<net> when the nft-media profile is on}
+      NFT_MEDIA_HANDLER_AWS_SECRET_ACCESS_KEY: ${NFT_MEDIA_S3_SECRET_ACCESS_KEY:?set in .env.<net> when the nft-media profile is on}
+      NFT_MEDIA_HANDLER_AWS_BUCKET_HOST: ${NFT_MEDIA_S3_HOST:?set in .env.<net> when the nft-media profile is on}
+      NFT_MEDIA_HANDLER_AWS_BUCKET_NAME: ${NFT_MEDIA_S3_BUCKET:?set in .env.<net> when the nft-media profile is on}
+      NFT_MEDIA_HANDLER_AWS_PUBLIC_BUCKET_URL: ${NFT_MEDIA_S3_PUBLIC_URL:?set in .env.<net> when the nft-media profile is on}
       # producer node -> folder inside the bucket where this network's media goes
-      NFT_MEDIA_HANDLER_NODES_MAP: '{"producer@${BACKEND_IP:-10.56.67.10}": "/${NFT_MEDIA_S3_FOLDER:?set in .env.<net>}"}'
+      NFT_MEDIA_HANDLER_NODES_MAP: '{"producer@${BACKEND_IP:-10.56.67.10}": "/${NFT_MEDIA_S3_FOLDER:?set in .env.<net> when the nft-media profile is on}"}'
+      RELEASE_DISTRIBUTION: name
+      RELEASE_COOKIE: ${RELEASE_COOKIE:?set in .env.<net> when the nft-media profile is on}
       RELEASE_NODE: worker@${NFT_MEDIA_HANDLER_IP:-10.56.67.11}
+      ERL_EPMD_ADDRESS: ${NFT_MEDIA_HANDLER_IP:-10.56.67.11}
+      ELIXIR_ERL_OPTIONS: -kernel inet_dist_use_interface ${NFT_MEDIA_HANDLER_IP_TUPLE:-{10,56,67,11}} -kernel inet_dist_listen_min 9100 -kernel inet_dist_listen_max 9100 ${NFT_MEDIA_S3_ERL_OPTIONS:-}
 
   # ---------------------------------------------------------------- frontend
   frontend:
     # Newest public tag (see backend note); v2.4+ ship only to the private registry.
     image: ghcr.io/blockscout/frontend:v2.3.5@sha256:4b69f44148414b55c6b8550bc3270c63c9f99e923d54ef0b307e762af6bac90a
+    <<: *logging
     restart: always
     depends_on:
       - backend
     env_file:
       - envs/frontend.common.env
+    # list form: NEXT_PUBLIC_*_PORT are passed through from .env.<net> by
+    # name and OMITTED when unset there. The image's env validator refuses an
+    # empty port ("must be a number") and exits, and a set port is echoed into
+    # every absolute URL the app builds (`https://host:443/...`), so behind
+    # the TLS ingress the right value is no value at all.
     environment:
-      NEXT_PUBLIC_NETWORK_ID: ${CHAIN_ID}
-      NEXT_PUBLIC_NETWORK_NAME: ${NETWORK_DISPLAY_NAME}
-      NEXT_PUBLIC_NETWORK_SHORT_NAME: Konstellation
-      NEXT_PUBLIC_NETWORK_RPC_URL: ${PUBLIC_RPC_URL:?set in .env.<net>}
-      NEXT_PUBLIC_IS_TESTNET: ${IS_TESTNET:?set in .env.<net>}
+      - NEXT_PUBLIC_NETWORK_ID=${CHAIN_ID}
+      - NEXT_PUBLIC_NETWORK_NAME=${NETWORK_DISPLAY_NAME}
+      - NEXT_PUBLIC_NETWORK_SHORT_NAME=Konstellation
+      - NEXT_PUBLIC_NETWORK_RPC_URL=${PUBLIC_RPC_URL:?set in .env.<net>}
+      - NEXT_PUBLIC_IS_TESTNET=${IS_TESTNET:?set in .env.<net>}
       # Where the browser reaches this stack (the nginx proxy below).
-      NEXT_PUBLIC_API_HOST: ${EXPLORER_HOST:?set in .env.<net>}
-      NEXT_PUBLIC_API_PORT: ${EXPLORER_PUBLIC_PORT:-}
-      NEXT_PUBLIC_API_PROTOCOL: ${EXPLORER_PROTOCOL:?set in .env.<net>}
-      NEXT_PUBLIC_API_WEBSOCKET_PROTOCOL: ${EXPLORER_WS_PROTOCOL:?set in .env.<net>}
-      NEXT_PUBLIC_APP_HOST: ${EXPLORER_HOST}
-      NEXT_PUBLIC_APP_PORT: ${EXPLORER_PUBLIC_PORT:-}
-      NEXT_PUBLIC_APP_PROTOCOL: ${EXPLORER_PROTOCOL}
-      NEXT_PUBLIC_STATS_API_HOST: ${STATS_PUBLIC_URL:?set in .env.<net>}
+      - NEXT_PUBLIC_API_HOST=${EXPLORER_HOST}
+      - NEXT_PUBLIC_API_PORT
+      - NEXT_PUBLIC_API_PROTOCOL=${EXPLORER_PROTOCOL}
+      - NEXT_PUBLIC_API_WEBSOCKET_PROTOCOL=${EXPLORER_WS_PROTOCOL:?set in .env.<net>}
+      - NEXT_PUBLIC_APP_HOST=${EXPLORER_HOST}
+      - NEXT_PUBLIC_APP_PORT
+      - NEXT_PUBLIC_APP_PROTOCOL=${EXPLORER_PROTOCOL}
+      - NEXT_PUBLIC_STATS_API_HOST=${STATS_PUBLIC_URL:?set in .env.<net>}
       # branding/ is served by the proxy at /branding/ (see nginx/default.conf.template)
-      NEXT_PUBLIC_NETWORK_LOGO: ${EXPLORER_PUBLIC_URL:?set in .env.<net>}/branding/logo.svg
-      NEXT_PUBLIC_NETWORK_ICON: ${EXPLORER_PUBLIC_URL}/branding/icon.svg
+      - NEXT_PUBLIC_NETWORK_LOGO=${EXPLORER_PUBLIC_URL:?set in .env.<net>}/branding/logo.svg
+      - NEXT_PUBLIC_NETWORK_LOGO_DARK=${EXPLORER_PUBLIC_URL}/branding/logo-dark.svg
+      - NEXT_PUBLIC_NETWORK_ICON=${EXPLORER_PUBLIC_URL}/branding/icon.svg
 
   # ---------------------------------------------------------------- stats
   stats:
     image: ghcr.io/blockscout/stats:v2.19.1@sha256:a618847070aa0d8256b99082de882f6c5fca7cd20721e04511ee0e1bb5d0b6b5
+    <<: *logging
     restart: always
     depends_on:
       stats-db:
@@ -260,6 +326,7 @@ services:
     # applies to postgres (db-init): chown the volumes before the service
     # starts. Idempotent; runs on every `up`.
     image: alpine:3.22.2@sha256:4b7ce07002c69e8f3d704a9c5d6fd3053be500b7f1c69fc0d80990c2ad8dd412
+    <<: *logging
     restart: "no"
     user: "0:0"
     command: ["sh", "-c", "chown -R 1001:1001 /compilers/solidity /compilers/vyper && ls -ld /compilers/*"]
@@ -269,6 +336,7 @@ services:
 
   smart-contract-verifier:
     image: ghcr.io/blockscout/smart-contract-verifier:v1.10.7@sha256:0b82d1e2f57354b5aa785b33cc82d24a1d2e2d5838dce6adcb81e8bc144c1724
+    <<: *logging
     # amd64 on every host, as upstream does: the solc binaries it downloads
     # (SOLC_LIST_URL) are linux-amd64, and an x86 solc inside a native arm64
     # container dies with "rosetta error: failed to open elf at
@@ -294,7 +362,7 @@ services:
     # Indexes UserOperations through the preinstalled EntryPoints (ENGINEERING.md
     # §6.3: v0.7 + v0.8 at their canonical addresses; no v0.6 on Konstellation).
     image: ghcr.io/blockscout/user-ops-indexer:v1.4.3@sha256:d0ffe9c672d9c5cf1e035b2dd8e4baf9e9b28d3382822ea2d07e69a924562932
-    <<: *host-gateway
+    <<: [*host-gateway, *logging]
     restart: always
     depends_on:
       rpc-preflight:
@@ -313,6 +381,7 @@ services:
   # ---------------------------------------------------------------- proxy
   proxy:
     image: nginx:1.28-alpine@sha256:a8b39bd9cf0f83869a2162827a0caf6137ddf759d50a171451b335cecc87d236
+    <<: *logging
     restart: always
     depends_on:
       - backend
@@ -326,18 +395,24 @@ services:
       FRONT_PROXY_PASS: http://frontend:3000
       STATS_PROXY_PASS: http://stats:8050
       CORS_ORIGIN: ${EXPLORER_PUBLIC_URL}
+    # Published on loopback only: the TLS ingress on the same host is what
+    # the internet talks to, and Docker's published ports bypass ufw/nftables
+    # INPUT rules. EXPLORER_BIND=0.0.0.0 only if the ingress is elsewhere.
     ports:
       - target: 80
         published: ${EXPLORER_PORT:-80}
+        host_ip: ${EXPLORER_BIND:-127.0.0.1}
       - target: 8080
         published: ${STATS_PORT:-8080}
+        host_ip: ${EXPLORER_BIND:-127.0.0.1}
 
   # ---------------------------------------------------------------- local S3
-  # `COMPOSE_PROFILES=local-s3` (set in .env.local): an S3 stand-in so NFT
-  # media can be tested on the dev chain. Not for any real network.
+  # `local-s3` profile (.env.local): an S3 stand-in so NFT media can be tested
+  # on the dev chain. Not for any real network.
   local-s3-certs:
     profiles: ["local-s3"]
     image: alpine/openssl:3.5.4@sha256:42c7389ef077aed0eb4e96d0abbd094083d701bbaff1313073b061c0c9cd8278
+    <<: *logging
     restart: "no"
     entrypoint: ["sh", "-c"]
     command:
@@ -360,6 +435,7 @@ services:
   minio:
     profiles: ["local-s3"]
     image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    <<: *logging
     restart: always
     depends_on:
       local-s3-certs:
@@ -367,8 +443,8 @@ services:
     # https on 443: the backend's S3 client is hardcoded to https and port 443
     command: server /data --address ":443" --certs-dir /certs --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: ${NFT_MEDIA_S3_ACCESS_KEY_ID}
-      MINIO_ROOT_PASSWORD: ${NFT_MEDIA_S3_SECRET_ACCESS_KEY}
+      MINIO_ROOT_USER: ${NFT_MEDIA_S3_ACCESS_KEY_ID:-}
+      MINIO_ROOT_PASSWORD: ${NFT_MEDIA_S3_SECRET_ACCESS_KEY:-}
     volumes:
       - local-s3-data:/data
       - local-s3-certs:/certs:ro
@@ -376,6 +452,7 @@ services:
   local-s3-init:
     profiles: ["local-s3"]
     image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+    <<: *logging
     restart: "no"
     depends_on:
       - minio
@@ -388,15 +465,16 @@ services:
         mc --insecure anonymous set download "local/$$BUCKET"
         echo "bucket $$BUCKET ready, anonymous read"
     environment:
-      MINIO_ROOT_USER: ${NFT_MEDIA_S3_ACCESS_KEY_ID}
-      MINIO_ROOT_PASSWORD: ${NFT_MEDIA_S3_SECRET_ACCESS_KEY}
-      BUCKET: ${NFT_MEDIA_S3_BUCKET}
+      MINIO_ROOT_USER: ${NFT_MEDIA_S3_ACCESS_KEY_ID:-}
+      MINIO_ROOT_PASSWORD: ${NFT_MEDIA_S3_SECRET_ACCESS_KEY:-}
+      BUCKET: ${NFT_MEDIA_S3_BUCKET:-}
 
   local-s3-proxy:
     # Plain-http front for the browser (it would refuse MinIO's self-signed
     # cert); NFT_MEDIA_S3_PUBLIC_URL in .env.local points here.
     profiles: ["local-s3"]
     image: nginx:1.28-alpine@sha256:a8b39bd9cf0f83869a2162827a0caf6137ddf759d50a171451b335cecc87d236
+    <<: *logging
     restart: always
     depends_on:
       - minio
@@ -405,6 +483,7 @@ services:
     ports:
       - target: 8082
         published: ${LOCAL_S3_PUBLIC_PORT:-3082}
+        host_ip: ${EXPLORER_BIND:-127.0.0.1}
 
 volumes:
   local-s3-certs:

@@ -4,8 +4,9 @@
 #
 # Refuses (exit 1) unless the target RPC:
 #   1. answers eth_chainId with the expected EIP-155 id;
-#   2. serves historical state — eth_getBalance at block 1 (a pruned node keeps
-#      only the last `pruning-keep-recent` heights and errors on old ones);
+#   2. serves historical state — eth_getBalance at block 1 and at a height
+#      well behind the head (a pruned node keeps only the last
+#      `pruning-keep-recent` heights and errors on older ones);
 #   3. exposes the debug namespace — debug_traceBlockByNumber on the latest
 #      block returns a result, and debug_traceTransaction is a known method;
 #   4. (if RPC_WS_URL is set) accepts a WebSocket upgrade on the ws endpoint,
@@ -13,6 +14,14 @@
 #
 # POSIX sh + curl + sed/grep only, so the same script runs on a laptop and
 # inside the `rpc-preflight` compose service (curlimages/curl has no jq).
+#
+# Limits, so nobody over-trusts it: a node whose pruning has not yet reached
+# the probed heights (e.g. `pruning = "default"` keeps 362 880 recent states,
+# so it looks like an archive until it is that tall) passes. The check is a
+# tripwire, not the proof — `pruning = "nothing"` in the node's app.toml is.
+# In compose the backend depends on this service completing successfully,
+# which `docker compose up` enforces; a plain container restart does not
+# re-run it.
 #
 # Usage:
 #   RPC_HTTP_URL=http://127.0.0.1:8545 CHAIN_ID=56670 scripts/check-rpc.sh
@@ -115,6 +124,18 @@ if ! has_result "$body"; then
 fi
 ok "eth_getBalance at block 1 answered — historical state is available"
 
+# ...and at a height a pruned node with a small keep-recent window (the §9.2
+# validator profile keeps 100) would already have dropped, in case block 1
+# is somehow special-cased or the chain is young.
+if [ "$head_dec" -gt 1000 ]; then
+  old_hex=$(printf '0x%x' $((head_dec - 1000)))
+  body=$(rpc "$RPC_HTTP_URL" eth_getBalance "[\"$ARCHIVE_PROBE_ADDRESS\",\"$old_hex\"]") || fail "eth_getBalance failed"
+  has_result "$body" || fail "eth_getBalance at block $((head_dec - 1000)) (head - 1000) has no result — this is a PRUNED node (§5.2): $(error_message "$body")"
+  ok "eth_getBalance at head-1000 ($((head_dec - 1000))) answered"
+else
+  note "head is $head_dec (< 1000): the head-1000 probe is skipped; a pruned node cannot be told apart from an archive node this early"
+fi
+
 # also make sure the block itself is served (a node that state-synced from a
 # snapshot has no early blocks either)
 body=$(rpc "$RPC_HTTP_URL" eth_getBlockByNumber '["0x1", false]') || fail "eth_getBlockByNumber failed"
@@ -172,11 +193,15 @@ else
 fi
 
 # ---- informational ---------------------------------------------------------
-body=$(rpc "$RPC_HTTP_URL" txpool_status '[]') || true
-if [ "$(error_code "$body")" = "-32601" ]; then
+body=$(rpc "$RPC_HTTP_URL" txpool_status '[]') || body=""
+if [ -z "$body" ]; then
+  note "txpool_status request failed (no response) — cannot tell whether the txpool namespace is on"
+elif [ "$(error_code "$body")" = "-32601" ]; then
   note "txpool namespace is off — pending-transaction display will be empty (INDEXER_DISABLE_PENDING_TRANSACTIONS_FETCHER=true is set for that reason)"
-else
+elif has_result "$body"; then
   ok "txpool namespace available"
+else
+  note "txpool_status answered with an error: $(error_message "$body")"
 fi
 
 printf 'check-rpc: PASS — %s is an archive node with tracing for chain %s\n' "$RPC_HTTP_URL" "$CHAIN_ID"

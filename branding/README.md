@@ -7,7 +7,8 @@ and the frontend is pointed at it through `NEXT_PUBLIC_NETWORK_LOGO` /
 
 | File | Used for | Status |
 |---|---|---|
-| `logo.svg` | header logo (frontend `NEXT_PUBLIC_NETWORK_LOGO`; ideally ≤ 240×48, transparent) | **PLACEHOLDER** — an SVG text mark. A real logo is needed before testnet-1 goes public. |
+| `logo.svg` | header logo on the light theme (frontend `NEXT_PUBLIC_NETWORK_LOGO`; ideally ≤ 240×48, transparent, dark wordmark) | **PLACEHOLDER** — an SVG text mark. A real logo is needed before testnet-1 goes public. |
+| `logo-dark.svg` | the same for the dark theme (`NEXT_PUBLIC_NETWORK_LOGO_DARK`; light wordmark) | **PLACEHOLDER** — same. |
 | `icon.svg` | favicon / compact mark (`NEXT_PUBLIC_NETWORK_ICON`; square) | **PLACEHOLDER** — same. |
 | `token-metadata.json` | KASH name, symbol, decimals, base denom, chain ids — for the explorer envs and for `chain-config` / wallet listings to copy from | real values (ENGINEERING.md §1, D2) |
 
@@ -18,10 +19,10 @@ The frontend's colour tokens live in `envs/frontend.common.env`
 values are a neutral dark-blue placeholder palette (`#0b1020` → `#1c2a5a`,
 accent `#7aa2ff`, text `#f4f6fb`), chosen only so the placeholder logo is
 legible. When the brand is decided, change them there and keep this note in
-sync. Blockscout frontend v2.3 also accepts a dark-mode logo/icon
-(`NEXT_PUBLIC_NETWORK_LOGO_DARK`, `NEXT_PUBLIC_NETWORK_ICON_DARK`) — add
-`logo-dark.svg` / `icon-dark.svg` here and wire them in `docker-compose.yml`
-if the real mark needs them.
+sync. The dark-theme logo is wired (`NEXT_PUBLIC_NETWORK_LOGO_DARK`); the icon has
+its own background so one file serves both themes — add `icon-dark.svg` and
+`NEXT_PUBLIC_NETWORK_ICON_DARK` in `docker-compose.yml` if the real mark
+needs it.
 
 ## Token metadata
 
