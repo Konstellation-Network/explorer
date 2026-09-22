@@ -1,0 +1,233 @@
+#!/bin/sh
+# Explorer RPC preflight — ENGINEERING.md §5.2 "Explorer RPC target is an archive
+# node, not pruned" and §6.5 "Blockscout requires debug_traceTransaction".
+#
+# Refuses (exit 1) unless the target RPC:
+#   1. answers eth_chainId with the expected EIP-155 id;
+#   2. serves historical state — eth_getBalance at block 1 and at a height
+#      well behind the head (a pruned node keeps only the last
+#      `pruning-keep-recent` heights and errors on older ones);
+#   3. exposes the debug namespace AND tracing really works —
+#      debug_traceBlockByNumber on the head, debug_traceCall of a plain
+#      transfer (a real trace, no transaction needed) and, when a
+#      transaction exists in the last 50 blocks (or TRACE_TX_HASH is given),
+#      debug_traceTransaction on it;
+#   4. (if RPC_WS_URL is set) accepts a WebSocket upgrade on the ws endpoint,
+#      which Blockscout uses for the newHeads subscription. Blockscout's
+#      client sends no Origin header (cosmos/evm admits Origin-less
+#      server-side clients); set WS_ORIGIN to also test a browser origin
+#      against the node's ws-origins list.
+#
+# POSIX sh + curl + sed/grep only, so the same script runs on a laptop and
+# inside the `rpc-preflight` compose service (curlimages/curl has no jq).
+#
+# Limits, so nobody over-trusts it: a node whose pruning has not yet reached
+# the probed heights (e.g. `pruning = "default"` keeps 362 880 recent states,
+# so it looks like an archive until it is that tall) passes. The check is a
+# tripwire, not the proof — `pruning = "nothing"` in the node's app.toml is.
+# In compose the backend depends on this service completing successfully,
+# which `docker compose up` enforces; a plain container restart does not
+# re-run it.
+#
+# Usage:
+#   RPC_HTTP_URL=http://127.0.0.1:8545 CHAIN_ID=56670 scripts/check-rpc.sh
+#   RPC_HTTP_URL=... RPC_TRACE_URL=... RPC_WS_URL=ws://... CHAIN_ID=... scripts/check-rpc.sh
+#
+# Environment:
+#   RPC_HTTP_URL   (required) JSON-RPC over HTTP
+#   RPC_TRACE_URL  (optional) endpoint used for debug_* — defaults to RPC_HTTP_URL
+#   RPC_WS_URL     (optional) ws:// or wss:// endpoint for subscriptions
+#   CHAIN_ID       (required) expected decimal EIP-155 chain id
+#   ARCHIVE_PROBE_ADDRESS (optional) address to query at block 1; any address
+#                  works — the check is that the node *answers* for an old
+#                  height, not what the balance is. Defaults to the zero address.
+#   TRACE_TX_HASH  (optional) a tx hash to trace; if unset the script looks for
+#                  one in the last 50 blocks. Either way debug_traceCall must
+#                  return a real trace.
+#   WS_ORIGIN      (optional) Origin header for the WebSocket check.
+#   CURL_MAX_TIME  (optional) per-request timeout in seconds, default 15.
+
+set -u
+
+RPC_HTTP_URL="${RPC_HTTP_URL:-}"
+RPC_TRACE_URL="${RPC_TRACE_URL:-$RPC_HTTP_URL}"
+RPC_WS_URL="${RPC_WS_URL:-}"
+CHAIN_ID="${CHAIN_ID:-}"
+ARCHIVE_PROBE_ADDRESS="${ARCHIVE_PROBE_ADDRESS:-0x0000000000000000000000000000000000000000}"
+TRACE_TX_HASH="${TRACE_TX_HASH:-}"
+WS_ORIGIN="${WS_ORIGIN:-}"
+CURL_MAX_TIME="${CURL_MAX_TIME:-15}"
+
+fail() { printf 'check-rpc: FAIL: %s\n' "$*" >&2; exit 1; }
+ok()   { printf 'check-rpc: ok   %s\n' "$*"; }
+note() { printf 'check-rpc: note %s\n' "$*"; }
+
+[ -n "$RPC_HTTP_URL" ] || fail "RPC_HTTP_URL is not set"
+[ -n "$CHAIN_ID" ] || fail "CHAIN_ID is not set"
+command -v curl >/dev/null 2>&1 || fail "curl not found"
+
+# rpc URL METHOD PARAMS-JSON  → raw JSON body on stdout; exit 1 on transport error
+rpc() {
+  _url="$1"; _method="$2"; _params="$3"
+  # --retry-connrefused: a node whose accept queue is briefly full (an indexer
+  # opening its connection pool at the same moment) refuses for a moment;
+  # that is not "not an archive node".
+  curl -sS --max-time "$CURL_MAX_TIME" --retry 3 --retry-connrefused --retry-delay 2 \
+    -X POST -H 'content-type: application/json' \
+    --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$_method\",\"params\":$_params}" \
+    "$_url" 2>/dev/null
+}
+
+# has_result BODY → true if the body carries a non-null "result"
+has_result() {
+  printf '%s' "$1" | grep -q '"result":' && ! printf '%s' "$1" | grep -Eq '"result":[[:space:]]*null'
+}
+
+# error_code BODY → the numeric "code" inside "error", or empty
+error_code() {
+  printf '%s' "$1" | sed -n 's/.*"error":[[:space:]]*{[^}]*"code":[[:space:]]*\(-\{0,1\}[0-9]*\).*/\1/p' | head -n 1
+}
+
+# error_message BODY → the "message" inside "error", or empty
+error_message() {
+  printf '%s' "$1" | sed -n 's/.*"error":[[:space:]]*{[^}]*"message":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
+}
+
+# string_result BODY → the value of a string "result"
+string_result() {
+  printf '%s' "$1" | sed -n 's/.*"result":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
+}
+
+hex_to_dec() {
+  # $1 like 0xdd5e
+  _h=$(printf '%s' "$1" | sed 's/^0[xX]//')
+  [ -n "$_h" ] || { echo ""; return; }
+  printf '%d' "0x$_h" 2>/dev/null
+}
+
+# ---- 1. reachable + right chain -------------------------------------------
+body=$(rpc "$RPC_HTTP_URL" eth_chainId '[]') || fail "cannot reach $RPC_HTTP_URL"
+has_result "$body" || fail "eth_chainId returned no result from $RPC_HTTP_URL: $body"
+got_hex=$(string_result "$body")
+got_dec=$(hex_to_dec "$got_hex")
+[ "$got_dec" = "$CHAIN_ID" ] || fail "eth_chainId is $got_dec ($got_hex), expected $CHAIN_ID — wrong network, refusing to index it"
+ok "eth_chainId = $CHAIN_ID"
+
+body=$(rpc "$RPC_HTTP_URL" eth_blockNumber '[]') || fail "eth_blockNumber failed"
+has_result "$body" || fail "eth_blockNumber returned no result: $body"
+head_hex=$(string_result "$body")
+head_dec=$(hex_to_dec "$head_hex")
+ok "head block = $head_dec"
+
+# ---- 2. archive state ------------------------------------------------------
+# A node pruned with `pruning-keep-recent = 100` (ENGINEERING.md §9.2 validator
+# profile) answers eth_getBalance at block 1 with an error once it is past
+# height ~100; an archive node (`pruning = "nothing"`) answers at every height.
+if [ "$head_dec" -lt 2 ]; then
+  note "chain is at block $head_dec; archive check at block 1 is trivially true — re-run later"
+fi
+body=$(rpc "$RPC_HTTP_URL" eth_getBalance "[\"$ARCHIVE_PROBE_ADDRESS\",\"0x1\"]") || fail "eth_getBalance failed"
+if ! has_result "$body"; then
+  fail "eth_getBalance at block 1 has no result — this is a PRUNED node, not an archive node (§5.2). Point the explorer at an archive node with pruning = \"nothing\". Response: $(error_message "$body")"
+fi
+ok "eth_getBalance at block 1 answered — historical state is available"
+
+# ...and at a height a pruned node with a small keep-recent window (the §9.2
+# validator profile keeps 100) would already have dropped, in case block 1
+# is somehow special-cased or the chain is young.
+if [ "$head_dec" -gt 1000 ]; then
+  old_hex=$(printf '0x%x' $((head_dec - 1000)))
+  body=$(rpc "$RPC_HTTP_URL" eth_getBalance "[\"$ARCHIVE_PROBE_ADDRESS\",\"$old_hex\"]") || fail "eth_getBalance failed"
+  has_result "$body" || fail "eth_getBalance at block $((head_dec - 1000)) (head - 1000) has no result — this is a PRUNED node (§5.2): $(error_message "$body")"
+  ok "eth_getBalance at head-1000 ($((head_dec - 1000))) answered"
+else
+  note "head is $head_dec (< 1000): the head-1000 probe is skipped; a pruned node cannot be told apart from an archive node this early"
+fi
+
+# also make sure the block itself is served (a node that state-synced from a
+# snapshot has no early blocks either)
+body=$(rpc "$RPC_HTTP_URL" eth_getBlockByNumber '["0x1", false]') || fail "eth_getBlockByNumber failed"
+has_result "$body" || fail "eth_getBlockByNumber(1) has no result — early blocks missing (state-synced node?): $(error_message "$body")"
+ok "eth_getBlockByNumber(1) answered — early blocks are available"
+
+# ---- 3. debug namespace ----------------------------------------------------
+body=$(rpc "$RPC_TRACE_URL" debug_traceBlockByNumber "[\"$head_hex\", {\"tracer\":\"callTracer\"}]") || fail "cannot reach $RPC_TRACE_URL"
+code=$(error_code "$body")
+if [ "$code" = "-32601" ]; then
+  fail "debug_traceBlockByNumber is not available on $RPC_TRACE_URL — the debug namespace is off. Start the node with --json-rpc.api including 'debug' (app.toml [json-rpc] api)."
+fi
+# an empty block traces to [] which is still a result
+printf '%s' "$body" | grep -q '"result":' || fail "debug_traceBlockByNumber($head_hex) errored: $(error_message "$body")"
+ok "debug_traceBlockByNumber works on $RPC_TRACE_URL"
+
+# An empty block traces to [] even when the tracer is broken, so also trace a
+# call: a plain value transfer from the probe address must come back as a
+# CALL frame. This needs no transaction on chain.
+body=$(rpc "$RPC_TRACE_URL" debug_traceCall "[{\"from\":\"$ARCHIVE_PROBE_ADDRESS\",\"to\":\"$ARCHIVE_PROBE_ADDRESS\",\"value\":\"0x0\"}, \"latest\", {\"tracer\":\"callTracer\"}]") || fail "debug_traceCall request failed"
+[ "$(error_code "$body")" = "-32601" ] && fail "debug_traceCall is not available on $RPC_TRACE_URL — the debug namespace is off"
+printf '%s' "$body" | grep -q '"type":[[:space:]]*"CALL"' || fail "debug_traceCall did not return a CALL trace — tracing is not working: $(error_message "$body")$(printf '%s' "$body" | head -c 200)"
+ok "debug_traceCall returns a real trace"
+
+# find a real tx to trace, unless one was given
+if [ -z "$TRACE_TX_HASH" ]; then
+  i=$head_dec
+  stop=$((head_dec - 50)); [ "$stop" -lt 0 ] && stop=0
+  while [ "$i" -ge "$stop" ] && [ -z "$TRACE_TX_HASH" ]; do
+    body=$(rpc "$RPC_HTTP_URL" eth_getBlockByNumber "[\"$(printf '0x%x' "$i")\", false]") || break
+    TRACE_TX_HASH=$(printf '%s' "$body" | sed -n 's/.*"transactions":[[:space:]]*\[[[:space:]]*"\(0x[0-9a-fA-F]\{64\}\)".*/\1/p' | head -n 1)
+    i=$((i - 1))
+  done
+fi
+
+if [ -n "$TRACE_TX_HASH" ]; then
+  body=$(rpc "$RPC_TRACE_URL" debug_traceTransaction "[\"$TRACE_TX_HASH\", {\"tracer\":\"callTracer\"}]") || fail "debug_traceTransaction request failed"
+  code=$(error_code "$body")
+  [ "$code" = "-32601" ] && fail "debug_traceTransaction is not available on $RPC_TRACE_URL"
+  has_result "$body" || fail "debug_traceTransaction($TRACE_TX_HASH) errored: $(error_message "$body")"
+  ok "debug_traceTransaction traced $TRACE_TX_HASH"
+else
+  # no tx in the last 50 blocks: the tracer itself was proven by
+  # debug_traceCall above; here only that the method is registered — a
+  # registered method answers a bogus hash with a lookup error, an
+  # unregistered one with -32601
+  zero="0x0000000000000000000000000000000000000000000000000000000000000000"
+  body=$(rpc "$RPC_TRACE_URL" debug_traceTransaction "[\"$zero\", {\"tracer\":\"callTracer\"}]") || fail "debug_traceTransaction request failed"
+  code=$(error_code "$body")
+  [ "$code" = "-32601" ] && fail "debug_traceTransaction is not available on $RPC_TRACE_URL"
+  note "no transaction in the last 50 blocks to trace; debug_traceTransaction is registered (set TRACE_TX_HASH to trace a real one)"
+fi
+
+# ---- 4. websocket ----------------------------------------------------------
+if [ -n "$RPC_WS_URL" ]; then
+  http_url=$(printf '%s' "$RPC_WS_URL" | sed 's#^ws://#http://#; s#^wss://#https://#')
+  status=$(curl -s -o /dev/null --max-time 5 -w '%{http_code}' \
+    -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+    -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+    "$http_url" 2>/dev/null || true)
+  [ "$status" = "101" ] || fail "no WebSocket upgrade at $RPC_WS_URL (HTTP $status). Blockscout needs ws for newHeads; check [json-rpc] ws-address in app.toml."
+  ok "WebSocket upgrade accepted at $RPC_WS_URL (no Origin, as Blockscout connects)"
+  if [ -n "$WS_ORIGIN" ]; then
+    status=$(curl -s -o /dev/null --max-time 5 -w '%{http_code}' \
+      -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H "Origin: $WS_ORIGIN" \
+      -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+      "$http_url" 2>/dev/null || true)
+    [ "$status" = "101" ] || fail "WebSocket upgrade with Origin $WS_ORIGIN refused (HTTP $status) — the node's [json-rpc] ws-origins does not allow it"
+    ok "WebSocket upgrade accepted with Origin $WS_ORIGIN"
+  fi
+else
+  note "RPC_WS_URL not set; skipping WebSocket check"
+fi
+
+# ---- informational ---------------------------------------------------------
+body=$(rpc "$RPC_HTTP_URL" txpool_status '[]') || body=""
+if [ -z "$body" ]; then
+  note "txpool_status request failed (no response) — cannot tell whether the txpool namespace is on"
+elif [ "$(error_code "$body")" = "-32601" ]; then
+  note "txpool namespace is off — pending-transaction display will be empty (INDEXER_DISABLE_PENDING_TRANSACTIONS_FETCHER=true is set for that reason)"
+elif has_result "$body"; then
+  ok "txpool namespace available"
+else
+  note "txpool_status answered with an error: $(error_message "$body")"
+fi
+
+printf 'check-rpc: PASS — %s is an archive node with tracing for chain %s\n' "$RPC_HTTP_URL" "$CHAIN_ID"

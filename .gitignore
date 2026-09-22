@@ -1,2 +1,5 @@
+# explorer
 .DS_Store
 node_modules/
+# per-deployment secrets never go in git; see README "Secrets"
+.env.*.secrets

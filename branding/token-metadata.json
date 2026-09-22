@@ -1,0 +1,42 @@
+{
+  "$comment": "Native token metadata for the explorer and downstream tooling. Source of truth for the numbers is ENGINEERING.md \u00a71 (D2) and TOKENOMICS.md; this file mirrors them and must be updated in the same change when they move. logo/icon are PLACEHOLDERS (branding/README.md).",
+  "name": "KASH",
+  "symbol": "KASH",
+  "decimals": 18,
+  "baseDenom": "esp",
+  "baseDenomExponent": 18,
+  "displayDenom": "KASH",
+  "bech32Prefix": "kons",
+  "logoUri": "branding/logo.svg",
+  "iconUri": "branding/icon.svg",
+  "coingeckoId": null,
+  "networks": {
+    "local": {
+      "cosmosChainId": "konstellation-local-1",
+      "evmChainId": 56670
+    },
+    "testnet-1": {
+      "cosmosChainId": "testnet-1",
+      "evmChainId": 56671
+    },
+    "konstellation-1": {
+      "cosmosChainId": "konstellation-1",
+      "evmChainId": 5667
+    }
+  },
+  "units": {
+    "$comment": "Denomination ladder the explorer and wallets should agree on. Blockscout labels the 10^9 unit 'G'+baseDenom.",
+    "esp": {
+      "exponent": 0,
+      "note": "base unit; what Ethereum tooling calls wei"
+    },
+    "Gesp": {
+      "exponent": 9,
+      "note": "10^9 esp = 10^-9 KASH; what Ethereum tooling calls gwei \u2014 gas prices are quoted in this"
+    },
+    "KASH": {
+      "exponent": 18,
+      "note": "display unit"
+    }
+  }
+}

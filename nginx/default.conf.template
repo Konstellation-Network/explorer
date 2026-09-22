@@ -1,0 +1,108 @@
+# nginx front door for the explorer stack. Rendered by the nginx image's
+# envsubst entrypoint from the variables set on the `proxy` service in
+# docker-compose.yml. Mirrors upstream blockscout docker-compose/proxy/
+# default.conf.template minus the visualizer vhost (not run here), plus a
+# /branding/ location that serves ./branding (logo, icon).
+#
+# TLS is NOT terminated here: put this behind the platform's ingress
+# (ENGINEERING.md §9.1 — Coolify/k8s runs the stateless app tier).
+
+map $http_upgrade $connection_upgrade {
+  default upgrade;
+  ''      close;
+}
+
+# Behind the platform ingress the original scheme arrives in
+# X-Forwarded-Proto; pass it through instead of overwriting it with this
+# hop's plain "http". Direct (local) requests fall back to $scheme.
+map $http_x_forwarded_proto $fwd_proto {
+  default $http_x_forwarded_proto;
+  ''      $scheme;
+}
+
+server_tokens off;
+
+# Client IP for the backend's per-IP rate limit. The backend takes the
+# leftmost public address in X-Forwarded-For, so the header must never be
+# something the client wrote. TRUSTED_INGRESS_CIDR (env; empty by default):
+#   empty  -> no ingress in front: X-Forwarded-For is replaced with the
+#             connecting address, whatever the client sent;
+#   a CIDR -> requests arriving FROM that range (the TLS ingress, which sets
+#             the header from the real client) keep their X-Forwarded-For;
+#             everything else is replaced with the connecting address.
+# docker-compose.yml turns an empty value into "0.0.0.0/32", a range nothing
+# matches, so the geo block below stays valid.
+geo $from_trusted_ingress {
+  default 0;
+  ${TRUSTED_INGRESS_CIDR} 1;
+}
+map $from_trusted_ingress $client_xff {
+  1        $http_x_forwarded_for;
+  default  $remote_addr;
+}
+
+# ---- explorer: frontend + backend API on one origin -------------------------
+server {
+    listen       80;
+    server_name  _;
+    proxy_http_version 1.1;
+
+    location ~ ^/(api(?!-docs$)|socket|sitemap.xml|auth/auth0|auth/auth0/callback|auth/logout) {
+        # contract verification uploads (flattened sources, standard-json)
+        # go over 1 MB; the verifier itself accepts 2 MB (its
+        # SERVER__HTTP__MAX_BODY_SIZE), the backend wraps that in its own
+        # request — leave headroom.
+        client_max_body_size  8m;
+        proxy_pass            ${BACK_PROXY_PASS};
+        proxy_http_version    1.1;
+        proxy_set_header      Host "$host";
+        proxy_set_header      X-Real-IP "$remote_addr";
+        # see $client_xff above: never a client-supplied value
+        proxy_set_header      X-Forwarded-For "$client_xff";
+        proxy_set_header      X-Forwarded-Proto "$fwd_proto";
+        proxy_set_header      Upgrade "$http_upgrade";
+        proxy_set_header      Connection $connection_upgrade;
+        proxy_cache_bypass    $http_upgrade;
+    }
+
+    location /branding/ {
+        alias /usr/share/nginx/branding/;
+        add_header Cache-Control "public, max-age=3600";
+    }
+
+    location / {
+        proxy_pass            ${FRONT_PROXY_PASS};
+        proxy_http_version    1.1;
+        proxy_set_header      Host "$host";
+        proxy_set_header      X-Real-IP "$remote_addr";
+        proxy_set_header      X-Forwarded-For "$client_xff";
+        proxy_set_header      X-Forwarded-Proto "$fwd_proto";
+        proxy_set_header      Upgrade "$http_upgrade";
+        proxy_set_header      Connection $connection_upgrade;
+        proxy_cache_bypass    $http_upgrade;
+    }
+}
+
+# ---- stats API (the frontend calls it cross-origin) --------------------------
+server {
+    listen       8080;
+    server_name  _;
+    proxy_http_version 1.1;
+    proxy_hide_header Access-Control-Allow-Origin;
+    proxy_hide_header Access-Control-Allow-Methods;
+    add_header 'Access-Control-Allow-Origin' '${CORS_ORIGIN}' always;
+    add_header 'Access-Control-Allow-Credentials' 'true' always;
+    add_header 'Access-Control-Allow-Methods' 'PUT, GET, POST, OPTIONS, DELETE, PATCH' always;
+
+    location / {
+        proxy_pass            ${STATS_PROXY_PASS}/;
+        proxy_http_version    1.1;
+        proxy_set_header      Host "$host";
+        proxy_set_header      X-Real-IP "$remote_addr";
+        proxy_set_header      X-Forwarded-For "$client_xff";
+        proxy_set_header      X-Forwarded-Proto "$fwd_proto";
+        proxy_set_header      Upgrade "$http_upgrade";
+        proxy_set_header      Connection $connection_upgrade;
+        proxy_cache_bypass    $http_upgrade;
+    }
+}
