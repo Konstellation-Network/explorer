@@ -3,6 +3,7 @@
 # One compose file serves every network; the network is picked by the env file:
 #
 #   docker compose --env-file .env.local up -d            # dev chain, 56670
+#   docker compose --env-file .env.devnet-1 up -d         # devnet-1, 56672
 #   docker compose --env-file .env.testnet-1 up -d        # testnet-1, 56671
 #   docker compose --env-file .env.konstellation-1 up -d  # mainnet, 5667
 #
@@ -57,7 +58,7 @@ x-logging: &logging
 # network, where the internet-facing proxy and frontend live, can reach them.
 # Never attach this stack to a platform-shared network.
 #
-# The bucket is real object storage on testnet-1/mainnet (NFT_MEDIA_S3_* in
+# The bucket is real object storage on devnet-1/testnet-1/mainnet (NFT_MEDIA_S3_* in
 # .env.<net>); locally the `local-s3` profile runs MinIO behind a self-signed
 # cert (README "NFT media"). With NFT_MEDIA_ENABLED=false the S3 values are
 # not required, the `nft-media` profile stays off and the backend runs

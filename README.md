@@ -10,13 +10,14 @@ explorer/
 │                             # smart-contract-verifier, user-ops-indexer,
 │                             # nft-media-handler, nginx; `local-s3` profile
 ├── .env.local                # dev chain, EIP-155 56670 — real, runnable values
+├── .env.devnet-1             # 56672 — PLACEHOLDERS (TODO) until infra exists
 ├── .env.testnet-1            # 56671 — PLACEHOLDERS (TODO) until infra exists
 ├── .env.konstellation-1      # 5667  — PLACEHOLDERS (TODO) until infra exists
 ├── envs/*.common.env         # per-service settings shared by every network
 ├── nginx/default.conf.template
 ├── branding/                 # logo (placeholder), icon (placeholder), KASH metadata
 ├── scripts/check-rpc.sh      # archive-node + debug-namespace preflight
-├── scripts/check-placeholders.sh  # CI: testnet/mainnet env files stay placeholders
+├── scripts/check-placeholders.sh  # CI: devnet/testnet/mainnet env files stay placeholders
 └── .github/workflows/ci.yml  # compose config per env, pins, placeholders, frontend
                               # env validation, shellcheck, preflight refusal tests
 ```
@@ -89,11 +90,18 @@ anything privileged, and are published on `127.0.0.1` only (`EXPLORER_BIND`).
 Change `EXPLORER_PORT`/`STATS_PORT` and the matching `NEXT_PUBLIC_*_PORT` /
 `*_PUBLIC_URL` values in `.env.local` if they collide.
 
-## Deploy to testnet-1 / konstellation-1
+## Deploy to devnet-1 / testnet-1 / konstellation-1
+
+Three public networks (decided 2026-09-29): **devnet-1** is where dapp
+developers are pointed (one foundation-run validator, same release as
+mainnet, faucet-fed, rarely reset) — its explorer is the one most
+developers will see; **testnet-1** is the validator/operations rehearsal
+network (4 foundation-run validators, new releases land first, may be
+disrupted); **konstellation-1** is mainnet.
 
 1. `infra` provisions the network's archive node (terraform `archive` module,
    ansible group `archive`) and its private DNS name. Until then every host in
-   `.env.testnet-1` / `.env.konstellation-1` is a `TODO` and CI checks that
+   `.env.devnet-1` / `.env.testnet-1` / `.env.konstellation-1` is a `TODO` and CI checks that
    they stay that way.
 2. Fill the `TODO`s **in the deployment platform's env/secret store** (Coolify
    or k8s — `ENGINEERING.md §9.1` puts the stateless app tier there), not in
@@ -103,7 +111,7 @@ Change `EXPLORER_PORT`/`STATS_PORT` and the matching `NEXT_PUBLIC_*_PORT` /
    48` is fine for `SECRET_KEY_BASE` and (if NFT media is on) `openssl rand
    -base64 32` for `RELEASE_COOKIE`. The committed file stays the documented
    shape; the platform overrides values. CI checks the rendered config of
-   both files (`scripts/check-placeholders.sh`): secrets must be exactly
+   all three files (`scripts/check-placeholders.sh`): secrets must be exactly
    `TODO`, hosts must start with `TODO-`.
 3. `docker compose --env-file .env.<net> config` locally to check the render,
    then `up -d`. The preflight refuses to start the backend against the wrong
@@ -250,8 +258,8 @@ started as a standalone worker that talks to the backend over Erlang
 distribution and uploads to an **S3-compatible bucket over HTTPS** — scheme
 and port are hardcoded in 9.0.2, so the target is Cloudflare R2, AWS S3 or
 anything with an S3 API behind TLS, with anonymous reads on
-`NFT_MEDIA_S3_PUBLIC_URL` (bucket or CDN). It is **off** in the testnet-1 and
-mainnet env files until that bucket exists; turning it on is three lines
+`NFT_MEDIA_S3_PUBLIC_URL` (bucket or CDN). It is **off** in the devnet-1, testnet-1
+and mainnet env files until that bucket exists; turning it on is three lines
 that go together in `.env.<net>`: `NFT_MEDIA_ENABLED=true`,
 `COMPOSE_PROFILES=nft-media`, `RELEASE_DISTRIBUTION=name`. Settings and
 their rationale: `envs/nft-media.common.env`; per network: `NFT_MEDIA_S3_*`,
@@ -322,18 +330,19 @@ chain and watch it index, then commit with both in the message.
 
 ## Placeholders — what is not real yet
 
-- All `TODO-*` hostnames in `.env.testnet-1` and `.env.konstellation-1`
+- All `TODO-*` hostnames in `.env.devnet-1`, `.env.testnet-1` and
+  `.env.konstellation-1`
   (archive RPC, public RPC, explorer and stats hostnames) and their secrets.
 - `branding/logo.svg` (dark wordmark, light theme), `logo-dark.svg` (light
   wordmark, `NEXT_PUBLIC_NETWORK_LOGO_DARK`) and `icon.svg` are SVG text
-  marks; a real logo is needed before testnet-1 is public
+  marks; a real logo is needed before devnet-1 is public
   (`branding/README.md`).
 - The frontend colour palette in `envs/frontend.common.env` is a neutral
   placeholder.
 - `NEXT_PUBLIC_WALLET_CONNECT_PROJECT_ID` is unset, so "add network to
   wallet" / write-contract buttons stay hidden.
-- NFT media bucket (`NFT_MEDIA_S3_*`) and `RELEASE_COOKIE` for testnet-1 /
-  mainnet — need real object storage.
+- NFT media bucket (`NFT_MEDIA_S3_*`) and `RELEASE_COOKIE` for devnet-1 /
+  testnet-1 / mainnet — need real object storage.
 
 ## Secrets
 

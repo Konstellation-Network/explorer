@@ -1,5 +1,6 @@
 #!/bin/sh
-# CI guard for the placeholder env files (.env.testnet-1, .env.konstellation-1):
+# CI guard for the placeholder env files (.env.devnet-1, .env.testnet-1,
+# .env.konstellation-1):
 # every value that must stay a placeholder until infra exists is checked in
 # the RENDERED compose config (`docker compose config --format json`), so
 # `export KEY=…`, leading whitespace, a `TODO` in a comment or a value like
@@ -12,7 +13,7 @@
 # in that layout every client's X-Forwarded-For is replaced, which is safe,
 # but usually means the ingress was forgotten.
 #
-# Usage: scripts/check-placeholders.sh .env.testnet-1 [.env.konstellation-1 ...]
+# Usage: scripts/check-placeholders.sh .env.devnet-1 [.env.testnet-1 ...]
 set -eu
 
 command -v jq >/dev/null 2>&1 || { echo "check-placeholders: jq required" >&2; exit 2; }
