@@ -351,3 +351,7 @@ mnemonics are public too). The other env files carry `TODO` and CI refuses a
 real value in any secret or hostname (`scripts/check-placeholders.sh`, on the
 rendered config). `.env.*.secrets` is git-ignored if you want a local
 override file; pass it as a second `--env-file`.
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE). The Konstellation name and logo are trademarks and are not licensed; see the [trademark policy](https://github.com/Konstellation-Network/.github).
