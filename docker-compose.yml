@@ -229,6 +229,19 @@ services:
     # is safe: the backfiller re-queues every instance without thumbnails.
     # dets/queue_storage (the pending queue) is kept.
     command: sh -c "rm -f dets/tasks_in_progress; bin/blockscout eval \"Elixir.Explorer.ReleaseTasks.create_and_migrate()\" && exec bin/blockscout start"
+    # Healthy = the HTTP API answers, which it only does after the migrations
+    # in `command` have finished. stats, user-ops-indexer and the media worker
+    # wait on this: started alongside the backend, stats ran its first update
+    # against an empty database ("relation blocks does not exist") and pushed
+    # the daily groups ~23 h out, so the home page read NaN for a day
+    # (reproduced 2026-09-30 on a fresh local stack). Liveness, not readiness:
+    # readiness also judges indexing lag and would flap on a busy chain.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://localhost:4000/api/health/liveness"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5m
     env_file:
       - envs/backend.common.env
       - envs/nft-media.common.env
@@ -289,7 +302,7 @@ services:
     stop_grace_period: 1m
     depends_on:
       backend:
-        condition: service_started
+        condition: service_healthy  # migrations done; see backend healthcheck
     networks:
       default: {}
       erlang:
@@ -359,7 +372,7 @@ services:
       stats-db:
         condition: service_healthy
       backend:
-        condition: service_started
+        condition: service_healthy  # migrations done; see backend healthcheck
     env_file:
       - envs/stats.common.env
     environment:
@@ -424,7 +437,7 @@ services:
       db:
         condition: service_healthy
       backend:
-        condition: service_started
+        condition: service_healthy  # migrations done; see backend healthcheck
     env_file:
       - envs/user-ops-indexer.common.env
     environment:
