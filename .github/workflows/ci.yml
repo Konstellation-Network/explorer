@@ -21,7 +21,7 @@ jobs:
       - name: docker compose config (all env files)
         run: |
           set -eu
-          for env in .env.local .env.testnet-1 .env.konstellation-1; do
+          for env in .env.local .env.devnet-1 .env.testnet-1 .env.konstellation-1; do
             echo "== $env"
             docker compose --env-file "$env" config --quiet
           done
@@ -47,7 +47,7 @@ jobs:
       # on the RENDERED config, per variable (scripts/check-placeholders.sh),
       # so `export KEY=`, whitespace, comments or `real=TODO` cannot pass.
       - name: placeholder env files carry only placeholders
-        run: scripts/check-placeholders.sh .env.testnet-1 .env.konstellation-1
+        run: scripts/check-placeholders.sh .env.devnet-1 .env.testnet-1 .env.konstellation-1
 
       - name: chain ids match ENGINEERING.md §1
         run: |
@@ -58,6 +58,7 @@ jobs:
             echo "$1 -> $got"
           }
           check .env.local 56670
+          check .env.devnet-1 56672
           check .env.testnet-1 56671
           check .env.konstellation-1 5667
 
@@ -74,7 +75,7 @@ jobs:
           set -eu
           image=$(grep -E '^[[:space:]]*image: ghcr.io/blockscout/frontend:' docker-compose.yml | head -n1 | sed -E 's/^[[:space:]]*image:[[:space:]]*//')
           docker pull --quiet "$image"
-          for env in .env.local .env.testnet-1 .env.konstellation-1; do
+          for env in .env.local .env.devnet-1 .env.testnet-1 .env.konstellation-1; do
             echo "== $env"
             docker compose --env-file "$env" config --format json \
               | jq -r '.services.frontend.environment | to_entries[] | select(.value != null) | "\(.key)=\(.value)"' > /tmp/frontend.env

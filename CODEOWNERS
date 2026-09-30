@@ -13,6 +13,7 @@
 # which chain id it claims (ENGINEERING.md §5.2: archive node, not pruned;
 # §1: chain ids). Same owners, listed separately so a stricter rule can be
 # attached here without touching the catch-all. CODEOWNERS is last-match-wins.
+/.env.devnet-1         @defidevrel @Evangel90 @Levi-Ojukwu @OlolaJaco @Psalmuel01
 /.env.testnet-1        @defidevrel @Evangel90 @Levi-Ojukwu @OlolaJaco @Psalmuel01
 /.env.konstellation-1  @defidevrel @Evangel90 @Levi-Ojukwu @OlolaJaco @Psalmuel01
 /docker-compose.yml    @defidevrel @Evangel90 @Levi-Ojukwu @OlolaJaco @Psalmuel01

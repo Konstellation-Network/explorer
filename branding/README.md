@@ -7,7 +7,7 @@ and the frontend is pointed at it through `NEXT_PUBLIC_NETWORK_LOGO` /
 
 | File | Used for | Status |
 |---|---|---|
-| `logo.svg` | header logo on the light theme (frontend `NEXT_PUBLIC_NETWORK_LOGO`; ideally ≤ 240×48, transparent, dark wordmark) | **PLACEHOLDER** — an SVG text mark. A real logo is needed before testnet-1 goes public. |
+| `logo.svg` | header logo on the light theme (frontend `NEXT_PUBLIC_NETWORK_LOGO`; ideally ≤ 240×48, transparent, dark wordmark) | **PLACEHOLDER** — an SVG text mark. A real logo is needed before devnet-1 goes public. |
 | `logo-dark.svg` | the same for the dark theme (`NEXT_PUBLIC_NETWORK_LOGO_DARK`; light wordmark) | **PLACEHOLDER** — same. |
 | `icon.svg` | favicon / compact mark (`NEXT_PUBLIC_NETWORK_ICON`; square) | **PLACEHOLDER** — same. |
 | `token-metadata.json` | KASH name, symbol, decimals, base denom, chain ids — for the explorer envs and for `chain-config` / wallet listings to copy from | real values (ENGINEERING.md §1, D2) |

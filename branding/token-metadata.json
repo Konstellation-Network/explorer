@@ -15,6 +15,10 @@
       "cosmosChainId": "konstellation-local-1",
       "evmChainId": 56670
     },
+    "devnet-1": {
+      "cosmosChainId": "devnet-1",
+      "evmChainId": 56672
+    },
     "testnet-1": {
       "cosmosChainId": "testnet-1",
       "evmChainId": 56671
